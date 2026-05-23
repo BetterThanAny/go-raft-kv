@@ -1,7 +1,7 @@
 package storage
 
 import (
-	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -74,25 +74,40 @@ func (s *Store) AppendEntries(entries []LogEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Detect first-time creation so we know whether to fsync the parent dir.
+	_, statErr := os.Stat(s.wal)
+	created := errors.Is(statErr, os.ErrNotExist)
+
 	file, err := os.OpenFile(s.wal, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-
 	enc := json.NewEncoder(file)
 	for _, entry := range entries {
 		if err := enc.Encode(entry); err != nil {
+			_ = file.Close()
 			return err
 		}
 	}
-	return file.Sync()
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if created {
+		if err := syncDir(s.dir); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) ReplaceEntries(entries []LogEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return writeWALAtomic(s.wal, entries)
+	return writeWALAtomic(s.dir, s.wal, entries)
 }
 
 func (s *Store) SaveSnapshot(snapshot Snapshot) error {
@@ -101,29 +116,46 @@ func (s *Store) SaveSnapshot(snapshot Snapshot) error {
 	return writeJSONAtomic(s.snapshot, snapshot)
 }
 
+// readWAL parses the WAL file, tolerating a single partial trailing line caused
+// by a crash mid-write. A partial line at EOF is truncated; a corrupt complete
+// line in the middle is reported as an error.
 func readWAL(path string) ([]LogEntry, error) {
-	file, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
 
-	var entries []LogEntry
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
+	var (
+		entries []LogEntry
+		offset  int
+	)
+	for offset < len(data) {
+		nl := bytes.IndexByte(data[offset:], '\n')
+		if nl < 0 {
+			// Trailing bytes without a newline = partial write from a crash. Truncate.
+			if err := truncateFile(path, int64(offset)); err != nil {
+				return nil, fmt.Errorf("truncate partial WAL tail: %w", err)
+			}
+			break
+		}
+		line := bytes.TrimSpace(data[offset : offset+nl])
+		offset += nl + 1
+		if len(line) == 0 {
+			continue
+		}
 		var entry LogEntry
-		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
-			return nil, fmt.Errorf("decode WAL entry: %w", err)
+		if err := json.Unmarshal(line, &entry); err != nil {
+			return nil, fmt.Errorf("decode WAL entry at byte offset %d: %w", offset-nl-1, err)
 		}
 		entries = append(entries, entry)
 	}
-	return entries, scanner.Err()
+	return entries, nil
 }
 
-func writeWALAtomic(path string, entries []LogEntry) error {
+func writeWALAtomic(dir, path string, entries []LogEntry) error {
 	tmp := path + ".tmp"
 	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -143,7 +175,10 @@ func writeWALAtomic(path string, entries []LogEntry) error {
 	if err := file.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	return syncDir(dir)
 }
 
 func readJSONFile(path string, out any) error {
@@ -160,11 +195,12 @@ func writeJSONAtomic(path string, value any) error {
 		return err
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
 		return err
 	}
-	file, err := os.OpenFile(tmp, os.O_RDONLY, 0)
-	if err != nil {
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
 		return err
 	}
 	if err := file.Sync(); err != nil {
@@ -174,5 +210,53 @@ func writeJSONAtomic(path string, value any) error {
 	if err := file.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
+}
+
+func truncateFile(path string, size int64) error {
+	file, err := os.OpenFile(path, os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if err := file.Truncate(size); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
+}
+
+// syncDir fsyncs the directory so a prior rename becomes durable.
+// Best-effort on platforms (e.g. Windows) that disallow opening a dir for sync;
+// on Unix this is required for atomic-rename durability.
+func syncDir(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		// Some platforms (e.g. macOS on certain filesystems) may reject fsync on a directory.
+		// Treat EINVAL/ENOTSUP as success since we did our best.
+		var pathErr *os.PathError
+		if errors.As(err, &pathErr) {
+			if errno, ok := pathErr.Err.(interface{ Error() string }); ok {
+				msg := errno.Error()
+				if msg == "invalid argument" || msg == "operation not supported" {
+					return nil
+				}
+			}
+		}
+		return err
+	}
+	return f.Close()
 }
