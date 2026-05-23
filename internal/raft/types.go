@@ -98,6 +98,17 @@ type Transport interface {
 	InstallSnapshot(ctx context.Context, peerID string, req InstallSnapshotRequest) (InstallSnapshotResponse, error)
 }
 
+// Store is the persistence interface the raft Node depends on. *storage.Store
+// from the storage package implements this directly; tests can wrap it with a
+// fault-injecting decorator to exercise error paths.
+type Store interface {
+	Load() (storage.HardState, []storage.LogEntry, storage.Snapshot, error)
+	SaveHardState(storage.HardState) error
+	AppendEntries([]storage.LogEntry) error
+	ReplaceEntries([]storage.LogEntry) error
+	SaveSnapshot(storage.Snapshot) error
+}
+
 type PeerStatus struct {
 	ID         string `json:"id"`
 	Address    string `json:"address"`

@@ -22,7 +22,7 @@ type Node struct {
 	peerAddrs   map[string]string
 	clientAddrs map[string]string
 	transport   Transport
-	store       *storage.Store
+	store       Store
 	sm          StateMachine
 
 	mu             sync.Mutex
@@ -51,7 +51,7 @@ type Node struct {
 	stopOnce  sync.Once
 }
 
-func NewNode(cfg Config, store *storage.Store, sm StateMachine, transport Transport) (*Node, error) {
+func NewNode(cfg Config, store Store, sm StateMachine, transport Transport) (*Node, error) {
 	if cfg.ID == "" {
 		return nil, errors.New("raft node id is required")
 	}
