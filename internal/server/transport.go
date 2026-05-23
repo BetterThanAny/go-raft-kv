@@ -3,15 +3,19 @@ package server
 import (
 	"context"
 	"errors"
-	"time"
+	"sync"
 
 	"go-raft-kv/api"
 	"go-raft-kv/internal/raft"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 )
 
 type GRPCTransport struct {
 	peers map[string]string
+
+	mu    sync.Mutex
+	conns map[string]*grpc.ClientConn
 }
 
 func NewGRPCTransport(peers map[string]string) *GRPCTransport {
@@ -19,16 +23,29 @@ func NewGRPCTransport(peers map[string]string) *GRPCTransport {
 	for id, addr := range peers {
 		out[id] = addr
 	}
-	return &GRPCTransport{peers: out}
+	return &GRPCTransport{
+		peers: out,
+		conns: make(map[string]*grpc.ClientConn),
+	}
+}
+
+// Close releases every pooled gRPC connection. Safe to call multiple times.
+func (t *GRPCTransport) Close() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for id, conn := range t.conns {
+		_ = conn.Close()
+		delete(t.conns, id)
+	}
+	return nil
 }
 
 func (t *GRPCTransport) RequestVote(ctx context.Context, peerID string, req raft.RequestVoteRequest) (raft.RequestVoteResponse, error) {
-	client, closeConn, err := t.client(ctx, peerID)
+	conn, err := t.connFor(peerID)
 	if err != nil {
 		return raft.RequestVoteResponse{}, err
 	}
-	defer closeConn()
-
+	client := api.NewRaftPeerClient(conn)
 	resp, err := client.RequestVote(ctx, &api.RequestVoteRequest{
 		Term:         req.Term,
 		CandidateID:  req.CandidateID,
@@ -36,17 +53,18 @@ func (t *GRPCTransport) RequestVote(ctx context.Context, peerID string, req raft
 		LastLogTerm:  req.LastLogTerm,
 	})
 	if err != nil {
+		t.dropConn(peerID, conn)
 		return raft.RequestVoteResponse{}, err
 	}
 	return raft.RequestVoteResponse{Term: resp.Term, VoteGranted: resp.VoteGranted}, nil
 }
 
 func (t *GRPCTransport) AppendEntries(ctx context.Context, peerID string, req raft.AppendEntriesRequest) (raft.AppendEntriesResponse, error) {
-	client, closeConn, err := t.client(ctx, peerID)
+	conn, err := t.connFor(peerID)
 	if err != nil {
 		return raft.AppendEntriesResponse{}, err
 	}
-	defer closeConn()
+	client := api.NewRaftPeerClient(conn)
 
 	entries := make([]api.LogEntry, 0, len(req.Entries))
 	for _, entry := range req.Entries {
@@ -65,6 +83,7 @@ func (t *GRPCTransport) AppendEntries(ctx context.Context, peerID string, req ra
 		LeaderCommit: req.LeaderCommit,
 	})
 	if err != nil {
+		t.dropConn(peerID, conn)
 		return raft.AppendEntriesResponse{}, err
 	}
 	return raft.AppendEntriesResponse{
@@ -76,11 +95,11 @@ func (t *GRPCTransport) AppendEntries(ctx context.Context, peerID string, req ra
 }
 
 func (t *GRPCTransport) InstallSnapshot(ctx context.Context, peerID string, req raft.InstallSnapshotRequest) (raft.InstallSnapshotResponse, error) {
-	client, closeConn, err := t.client(ctx, peerID)
+	conn, err := t.connFor(peerID)
 	if err != nil {
 		return raft.InstallSnapshotResponse{}, err
 	}
-	defer closeConn()
+	client := api.NewRaftPeerClient(conn)
 
 	resp, err := client.InstallSnapshot(ctx, &api.InstallSnapshotRequest{
 		Term:              req.Term,
@@ -90,23 +109,47 @@ func (t *GRPCTransport) InstallSnapshot(ctx context.Context, peerID string, req 
 		Data:              req.Snapshot.Data,
 	})
 	if err != nil {
+		t.dropConn(peerID, conn)
 		return raft.InstallSnapshotResponse{}, err
 	}
 	return raft.InstallSnapshotResponse{Term: resp.Term, Success: resp.Success}, nil
 }
 
-func (t *GRPCTransport) client(ctx context.Context, peerID string) (*api.RaftPeerClient, func(), error) {
+// connFor returns a cached gRPC client connection to the peer, dialing
+// lazily on first use. Connections are reused across RPCs so we don't pay
+// a TCP+TLS handshake on every heartbeat.
+func (t *GRPCTransport) connFor(peerID string) (*grpc.ClientConn, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if conn, ok := t.conns[peerID]; ok {
+		if conn.GetState() != connectivity.Shutdown {
+			return conn, nil
+		}
+		_ = conn.Close()
+		delete(t.conns, peerID)
+	}
 	addr := t.peers[peerID]
 	if addr == "" {
-		return nil, nil, errors.New("unknown peer")
+		return nil, errors.New("unknown peer")
 	}
-	dialCtx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
-	conn, err := grpc.DialContext(dialCtx, addr, append(api.DialOptions(), grpc.WithBlock())...)
-	cancel()
+	conn, err := grpc.NewClient(addr, api.DialOptions()...)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return api.NewRaftPeerClient(conn), func() { _ = conn.Close() }, nil
+	t.conns[peerID] = conn
+	return conn, nil
+}
+
+// dropConn removes a connection from the pool after an RPC error so the next
+// call dials fresh. Callers pass the connection they observed the error on, so
+// we don't drop a newer reconnection.
+func (t *GRPCTransport) dropConn(peerID string, observed *grpc.ClientConn) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if cur, ok := t.conns[peerID]; ok && cur == observed {
+		_ = cur.Close()
+		delete(t.conns, peerID)
+	}
 }
 
 var _ raft.Transport = (*GRPCTransport)(nil)

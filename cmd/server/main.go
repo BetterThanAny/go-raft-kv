@@ -70,6 +70,7 @@ func main() {
 	log.Printf("shutting down node=%s", cfg.id)
 	grpcServer.GracefulStop()
 	node.Stop()
+	_ = transport.Close()
 }
 
 type config struct {
