@@ -14,6 +14,11 @@ import (
 
 type applyOutcome struct {
 	result storage.ApplyResult
+	// err is non-nil when the proposal could not be completed in the current
+	// term — e.g. the node stepped down before commit, or shut down. A
+	// successful apply delivers err == nil even when result.OK is false (which
+	// only signals that the command itself was rejected by the state machine).
+	err error
 }
 
 type Node struct {
@@ -45,10 +50,12 @@ type Node struct {
 	waiters        map[uint64][]chan applyOutcome
 	lastErr        error
 
-	proposeMu sync.Mutex
-	applyCh   chan struct{}
-	stopCh    chan struct{}
-	stopOnce  sync.Once
+	proposeMu   sync.Mutex
+	applyCh     chan struct{}
+	replicateCh chan struct{}
+	stopCh      chan struct{}
+	stopOnce    sync.Once
+	loops       sync.WaitGroup
 }
 
 func NewNode(cfg Config, store Store, sm StateMachine, transport Transport) (*Node, error) {
@@ -127,6 +134,7 @@ func NewNode(cfg Config, store Store, sm StateMachine, transport Transport) (*No
 		rng:            rand.New(rand.NewSource(time.Now().UnixNano() + int64(hashID(cfg.ID)))),
 		waiters:        make(map[uint64][]chan applyOutcome),
 		applyCh:        make(chan struct{}, 1),
+		replicateCh:    make(chan struct{}, 1),
 		stopCh:         make(chan struct{}),
 	}
 	n.resetElectionLocked()
@@ -160,9 +168,19 @@ func normalizeConfig(cfg *Config) {
 }
 
 func (n *Node) Start() {
-	go n.electionLoop()
-	go n.heartbeatLoop()
-	go n.applyLoop()
+	n.loops.Add(3)
+	go func() {
+		defer n.loops.Done()
+		n.electionLoop()
+	}()
+	go func() {
+		defer n.loops.Done()
+		n.heartbeatLoop()
+	}()
+	go func() {
+		defer n.loops.Done()
+		n.applyLoop()
+	}()
 }
 
 func (n *Node) Stop() {
@@ -171,16 +189,49 @@ func (n *Node) Stop() {
 		n.mu.Lock()
 		for index, waiters := range n.waiters {
 			for _, waiter := range waiters {
-				waiter <- applyOutcome{result: storage.ApplyResult{OK: false, Error: "node stopped"}}
+				waiter <- applyOutcome{err: errors.New("node stopped")}
 				close(waiter)
 			}
 			delete(n.waiters, index)
 		}
 		n.mu.Unlock()
 	})
+	// Wait for the goroutines started by Start() to fully exit so callers can
+	// safely tear down the data directory without racing a still-running loop.
+	n.loops.Wait()
 }
 
 func (n *Node) Propose(ctx context.Context, command storage.Command) (storage.ApplyResult, error) {
+	waiter, index, err := n.proposeAppend(command)
+	if err != nil {
+		return storage.ApplyResult{}, err
+	}
+	// Wake the heartbeat loop so we don't wait for the next tick before
+	// replicating the new entry.
+	n.kickReplication()
+
+	select {
+	case outcome := <-waiter:
+		if outcome.err != nil {
+			return storage.ApplyResult{}, outcome.err
+		}
+		if !outcome.result.OK && outcome.result.Error != "" {
+			return outcome.result, errors.New(outcome.result.Error)
+		}
+		return outcome.result, nil
+	case <-ctx.Done():
+		n.removeWaiter(index, waiter)
+		return storage.ApplyResult{}, ctx.Err()
+	}
+}
+
+// proposeAppend atomically allocates the next log index, persists the entry to
+// the WAL, and registers a waiter that will be notified when the entry is
+// either applied (success) or invalidated by a step-down / shutdown. The
+// proposeMu lock is held only for this fast path so concurrent Propose calls
+// from different clients pipeline rather than serialize through the
+// replication+apply wait.
+func (n *Node) proposeAppend(command storage.Command) (chan applyOutcome, uint64, error) {
 	n.proposeMu.Lock()
 	defer n.proposeMu.Unlock()
 
@@ -188,59 +239,36 @@ func (n *Node) Propose(ctx context.Context, command storage.Command) (storage.Ap
 	if n.role != Leader {
 		err := n.notLeaderLocked()
 		n.mu.Unlock()
-		return storage.ApplyResult{}, err
+		return nil, 0, err
 	}
 	entry := storage.LogEntry{
 		Index:   n.lastIndexLocked() + 1,
 		Term:    n.currentTerm,
 		Command: command,
 	}
-	// Persist to WAL BEFORE mutating in-memory state. Otherwise heartbeats can
-	// observe a ghost entry that the leader hasn't durably written, and the
-	// cluster can commit a value the client sees as "failed".
+	// Persist to WAL before any in-memory mutation. proposeMu ensures index
+	// monotonicity across concurrent calls so the WAL is always append-ordered.
 	if err := n.store.AppendEntries([]storage.LogEntry{entry}); err != nil {
 		n.mu.Unlock()
-		return storage.ApplyResult{}, err
+		return nil, 0, err
 	}
 	n.log = append(n.log, entry)
 	n.matchIndex[n.id] = entry.Index
 	n.nextIndex[n.id] = entry.Index + 1
 	waiter := make(chan applyOutcome, 1)
 	n.waiters[entry.Index] = append(n.waiters[entry.Index], waiter)
+	// Single-node clusters need this to commit immediately (no peers will ever
+	// ack). For multi-node clusters this is a cheap no-op when the new entry
+	// doesn't yet have majority replication.
+	n.advanceCommitLocked()
 	n.mu.Unlock()
+	return waiter, entry.Index, nil
+}
 
-	for {
-		if n.hasMajorityFor(entry.Index) {
-			if err := n.commitTo(entry.Index); err != nil {
-				return storage.ApplyResult{}, err
-			}
-			break
-		}
-		if err := n.replicateAllOnce(ctx); err != nil && ctx.Err() != nil {
-			n.removeWaiter(entry.Index, waiter)
-			return storage.ApplyResult{}, err
-		}
-		if !n.isLeaderForEntry(entry.Term) {
-			n.removeWaiter(entry.Index, waiter)
-			return storage.ApplyResult{}, n.leaderHint()
-		}
-		select {
-		case <-ctx.Done():
-			n.removeWaiter(entry.Index, waiter)
-			return storage.ApplyResult{}, ctx.Err()
-		case <-time.After(20 * time.Millisecond):
-		}
-	}
-
+func (n *Node) kickReplication() {
 	select {
-	case outcome := <-waiter:
-		if !outcome.result.OK {
-			return outcome.result, errors.New(outcome.result.Error)
-		}
-		return outcome.result, nil
-	case <-ctx.Done():
-		n.removeWaiter(entry.Index, waiter)
-		return storage.ApplyResult{}, ctx.Err()
+	case n.replicateCh <- struct{}{}:
+	default:
 	}
 }
 
@@ -469,11 +497,12 @@ func (n *Node) heartbeatLoop() {
 		case <-n.stopCh:
 			return
 		case <-ticker.C:
-			if n.isLeader() {
-				ctx, cancel := context.WithTimeout(context.Background(), n.heartbeatEvery)
-				_ = n.replicateAllOnce(ctx)
-				cancel()
-			}
+		case <-n.replicateCh:
+		}
+		if n.isLeader() {
+			ctx, cancel := context.WithTimeout(context.Background(), n.heartbeatEvery)
+			_ = n.replicateAllOnce(ctx)
+			cancel()
 		}
 	}
 }
@@ -605,6 +634,9 @@ func (n *Node) becomeLeader(term uint64) {
 		n.log = append(n.log, noop)
 		n.matchIndex[n.id] = noop.Index
 		n.nextIndex[n.id] = noop.Index + 1
+		// Single-node clusters commit the no-op immediately; multi-node
+		// clusters defer to peer acks.
+		n.advanceCommitLocked()
 	}
 	n.mu.Unlock()
 
@@ -642,7 +674,32 @@ func (n *Node) becomeFollowerLocked(term uint64, leaderID string) error {
 		n.leaderID = prevLeader
 		return err
 	}
+	if prevRole == Leader {
+		// Any in-flight Propose for an entry that hasn't yet committed under
+		// our leadership must wake up and see NotLeader so the client can
+		// retry against the new leader. Entries already at or below
+		// commitIndex stay in n.waiters so the apply loop can still deliver
+		// the real result if/when those entries are applied locally.
+		n.failUncommittedWaitersLocked()
+	}
 	return nil
+}
+
+// failUncommittedWaitersLocked delivers a NotLeader outcome to every waiter
+// whose entry index has not yet been committed. Called when this node leaves
+// the leader role.
+func (n *Node) failUncommittedWaitersLocked() {
+	err := n.notLeaderLocked()
+	for index, waiters := range n.waiters {
+		if index <= n.commitIndex {
+			continue
+		}
+		for _, w := range waiters {
+			w <- applyOutcome{err: err}
+			close(w)
+		}
+		delete(n.waiters, index)
+	}
 }
 
 func (n *Node) replicateAllOnce(ctx context.Context) error {
@@ -860,21 +917,6 @@ func (n *Node) ensureQuorum(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-}
-
-func (n *Node) commitTo(index uint64) error {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if n.commitIndex < index {
-		prev := n.commitIndex
-		n.commitIndex = index
-		if err := n.persistHardStateLocked(); err != nil {
-			n.commitIndex = prev
-			return err
-		}
-		n.notifyApplyLocked()
-	}
-	return nil
 }
 
 func (n *Node) advanceCommitLocked() {
@@ -1134,18 +1176,6 @@ func (n *Node) waitUntilApplied(ctx context.Context, index uint64) error {
 	}
 }
 
-func (n *Node) hasMajorityFor(index uint64) bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	count := 1
-	for peerID := range n.peerAddrs {
-		if n.matchIndex[peerID] >= index {
-			count++
-		}
-	}
-	return count >= n.quorum()
-}
-
 func (n *Node) quorum() int {
 	return (len(n.peerAddrs)+1)/2 + 1
 }
@@ -1154,12 +1184,6 @@ func (n *Node) isLeader() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.role == Leader
-}
-
-func (n *Node) isLeaderForEntry(term uint64) bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.role == Leader && n.currentTerm == term
 }
 
 func (n *Node) resetElectionLocked() {
@@ -1173,12 +1197,6 @@ func (n *Node) resetElectionLocked() {
 
 func (n *Node) notLeaderLocked() error {
 	return NotLeaderError{LeaderID: n.leaderID, LeaderAddress: n.leaderAddressLocked()}
-}
-
-func (n *Node) leaderHint() error {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.notLeaderLocked()
 }
 
 func (n *Node) leaderAddressLocked() string {
