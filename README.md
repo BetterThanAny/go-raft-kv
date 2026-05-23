@@ -2,6 +2,17 @@
 
 `go-raft-kv` is an engineering-oriented Raft key-value service written in Go. It is designed to demonstrate leader election, log replication, leader-only writes, linearizable leader reads, WAL recovery, snapshot compaction, node restart catch-up, a gRPC API, a CLI, Docker Compose multi-node bootstrapping, and reproducible tests.
 
+## 30-Second Summary
+
+| Signal | Details |
+| --- | --- |
+| Positioning | Go distributed KV service for backend interviews: Raft consensus, durable logs, snapshots, and fault recovery. |
+| Stack | Go 1.25, gRPC, Docker Compose, WAL JSONL storage, snapshot persistence, `kvctl` CLI. |
+| Hard parts | Leader election, majority log replication, leader redirect, linearizable reads through quorum heartbeat, WAL recovery, snapshot install/catch-up. |
+| Quick start | `docker compose up -d --build`; then `go run ./cmd/kvctl put user:1 alice` and `go run ./cmd/kvctl get user:1`. |
+| Validation | `go test ./...`, `go test -race ./...`, `go vet ./...`, plus a 3-node Docker failover smoke test. |
+| Benchmark / result | `BenchmarkSingleNodePut` documents WAL-backed write-path cost; local failover test shows 1-node failure tolerance in a 3-node cluster. |
+
 ## Architecture
 
 ```mermaid
@@ -126,4 +137,3 @@ This benchmark is intentionally conservative because every proposal persists to 
 - `api/proto/kv.proto` is the external API contract. The Go implementation uses a hand-written gRPC descriptor plus JSON codec so the repository does not require `protoc` for normal development.
 - Snapshot catch-up uses `InstallSnapshot` when a follower falls behind the leader's compacted log.
 - The Docker image builds `server` and `kvctl`; the compose entrypoint runs `server`.
-
