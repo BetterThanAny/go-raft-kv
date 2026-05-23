@@ -6,6 +6,9 @@ const (
 	OpPut    Operation = "put"
 	OpDelete Operation = "delete"
 	OpCAS    Operation = "cas"
+	// OpNoop is appended by a freshly elected leader so that a current-term
+	// entry exists and commitIndex can advance past any previous-term entries.
+	OpNoop Operation = "noop"
 )
 
 type Command struct {

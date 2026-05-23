@@ -34,6 +34,8 @@ func (sm *KVStateMachine) Apply(command storage.Command) storage.ApplyResult {
 		}
 		sm.data[command.Key] = command.Value
 		return storage.ApplyResult{OK: true, Found: true, Value: command.Value, Swapped: true}
+	case storage.OpNoop:
+		return storage.ApplyResult{OK: true}
 	default:
 		return storage.ApplyResult{OK: false, Error: "unknown command"}
 	}
