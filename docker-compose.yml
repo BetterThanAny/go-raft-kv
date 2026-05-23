@@ -1,0 +1,51 @@
+services:
+  node1:
+    build: .
+    command:
+      - -id=node1
+      - -listen=:9001
+      - -advertise=node1:9001
+      - -client-addrs=node1=127.0.0.1:9101,node2=127.0.0.1:9102,node3=127.0.0.1:9103
+      - -peers=node1=node1:9001,node2=node2:9001,node3=node3:9001
+      - -data-dir=/data
+      - -snapshot-threshold=16
+    ports:
+      - "9101:9001"
+    volumes:
+      - node1-data:/data
+
+  node2:
+    build: .
+    command:
+      - -id=node2
+      - -listen=:9001
+      - -advertise=node2:9001
+      - -client-addrs=node1=127.0.0.1:9101,node2=127.0.0.1:9102,node3=127.0.0.1:9103
+      - -peers=node1=node1:9001,node2=node2:9001,node3=node3:9001
+      - -data-dir=/data
+      - -snapshot-threshold=16
+    ports:
+      - "9102:9001"
+    volumes:
+      - node2-data:/data
+
+  node3:
+    build: .
+    command:
+      - -id=node3
+      - -listen=:9001
+      - -advertise=node3:9001
+      - -client-addrs=node1=127.0.0.1:9101,node2=127.0.0.1:9102,node3=127.0.0.1:9103
+      - -peers=node1=node1:9001,node2=node2:9001,node3=node3:9001
+      - -data-dir=/data
+      - -snapshot-threshold=16
+    ports:
+      - "9103:9001"
+    volumes:
+      - node3-data:/data
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+

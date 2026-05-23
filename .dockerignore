@@ -1,0 +1,8 @@
+.git
+.cache
+data
+bin
+dist
+.DS_Store
+coverage.out
+
