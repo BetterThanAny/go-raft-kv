@@ -110,6 +110,33 @@ func TestSnapshotCompactionAndRestartRecovery(t *testing.T) {
 	cluster.waitValue(t, leaderID, "k:09", "v:09")
 }
 
+// TestLinearizableGetAfterLeaderChange verifies a freshly elected leader can
+// serve a linearizable read of a value committed by the previous leader without
+// requiring a fresh client write. This exercises the no-op-on-becomeLeader path
+// that sweeps previous-term entries into the new leader's commitIndex, and the
+// readIndex barrier that uses fresh ack counts (not stale matchIndex).
+func TestLinearizableGetAfterLeaderChange(t *testing.T) {
+	cluster := newMemoryCluster(t, 3, 64)
+	defer cluster.stopAll()
+
+	leaderID, leader := cluster.waitLeader(t, "")
+	proposePut(t, leader, "kept", "across-leader-change")
+	cluster.waitActiveValue(t, "kept", "across-leader-change")
+
+	cluster.stopNode(leaderID)
+	_, newLeader := cluster.waitLeader(t, leaderID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	value, found, err := newLeader.LinearizableGet(ctx, "kept")
+	if err != nil {
+		t.Fatalf("linearizable get on new leader failed: %v", err)
+	}
+	if !found || value != "across-leader-change" {
+		t.Fatalf("expected linearizable get to see prev-term value, got value=%q found=%v", value, found)
+	}
+}
+
 func TestWALRecoversHardStateAndLog(t *testing.T) {
 	dir := t.TempDir()
 	store, err := storage.Open(dir)

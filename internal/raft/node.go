@@ -131,7 +131,9 @@ func NewNode(cfg Config, store *storage.Store, sm StateMachine, transport Transp
 	}
 	n.resetElectionLocked()
 	if hs.CommitIndex != commitIndex {
-		n.persistHardStateLocked()
+		if err := n.persistHardStateLocked(); err != nil {
+			return nil, err
+		}
 	}
 	return n, nil
 }
@@ -193,19 +195,19 @@ func (n *Node) Propose(ctx context.Context, command storage.Command) (storage.Ap
 		Term:    n.currentTerm,
 		Command: command,
 	}
+	// Persist to WAL BEFORE mutating in-memory state. Otherwise heartbeats can
+	// observe a ghost entry that the leader hasn't durably written, and the
+	// cluster can commit a value the client sees as "failed".
+	if err := n.store.AppendEntries([]storage.LogEntry{entry}); err != nil {
+		n.mu.Unlock()
+		return storage.ApplyResult{}, err
+	}
 	n.log = append(n.log, entry)
 	n.matchIndex[n.id] = entry.Index
 	n.nextIndex[n.id] = entry.Index + 1
 	waiter := make(chan applyOutcome, 1)
 	n.waiters[entry.Index] = append(n.waiters[entry.Index], waiter)
-	err := n.store.AppendEntries([]storage.LogEntry{entry})
-	if err == nil {
-		err = n.persistHardStateLocked()
-	}
 	n.mu.Unlock()
-	if err != nil {
-		return storage.ApplyResult{}, err
-	}
 
 	for {
 		if n.hasMajorityFor(entry.Index) {
@@ -300,16 +302,24 @@ func (n *Node) HandleRequestVote(req RequestVoteRequest) RequestVoteResponse {
 		return RequestVoteResponse{Term: n.currentTerm}
 	}
 	if req.Term > n.currentTerm {
-		n.becomeFollowerLocked(req.Term, "")
+		if err := n.becomeFollowerLocked(req.Term, ""); err != nil {
+			// Could not durably record the new term; do not grant a vote, otherwise
+			// a crash here would allow voting again in the same term after restart.
+			return RequestVoteResponse{Term: n.currentTerm}
+		}
 	}
 
 	canVote := n.votedFor == "" || n.votedFor == req.CandidateID
 	upToDate := req.LastLogTerm > n.lastTermLocked() ||
 		(req.LastLogTerm == n.lastTermLocked() && req.LastLogIndex >= n.lastIndexLocked())
 	if canVote && upToDate {
+		prevVotedFor := n.votedFor
 		n.votedFor = req.CandidateID
+		if err := n.persistHardStateLocked(); err != nil {
+			n.votedFor = prevVotedFor
+			return RequestVoteResponse{Term: n.currentTerm}
+		}
 		n.resetElectionLocked()
-		n.persistHardStateLocked()
 		return RequestVoteResponse{Term: n.currentTerm, VoteGranted: true}
 	}
 	return RequestVoteResponse{Term: n.currentTerm}
@@ -323,7 +333,9 @@ func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRespon
 		return AppendEntriesResponse{Term: n.currentTerm, LastLogIndex: n.lastIndexLocked()}
 	}
 	if req.Term > n.currentTerm || n.role != Follower {
-		n.becomeFollowerLocked(req.Term, req.LeaderID)
+		if err := n.becomeFollowerLocked(req.Term, req.LeaderID); err != nil {
+			return AppendEntriesResponse{Term: n.currentTerm, LastLogIndex: n.lastIndexLocked()}
+		}
 	}
 	n.leaderID = req.LeaderID
 	n.resetElectionLocked()
@@ -343,13 +355,22 @@ func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRespon
 		}
 	}
 
+	// Snapshot in-memory log before mutating so we can roll back if WAL write fails.
+	prevLog := n.log
 	changed := n.mergeEntriesLocked(req.Entries)
 	if changed {
-		n.store.ReplaceEntries(n.log)
+		if err := n.store.ReplaceEntries(n.log); err != nil {
+			n.log = prevLog
+			return AppendEntriesResponse{Term: n.currentTerm, LastLogIndex: n.lastIndexLocked()}
+		}
 	}
 	if req.LeaderCommit > n.commitIndex {
+		prevCommit := n.commitIndex
 		n.commitIndex = min(req.LeaderCommit, n.lastIndexLocked())
-		n.persistHardStateLocked()
+		if err := n.persistHardStateLocked(); err != nil {
+			n.commitIndex = prevCommit
+			return AppendEntriesResponse{Term: n.currentTerm, LastLogIndex: n.lastIndexLocked()}
+		}
 		n.notifyApplyLocked()
 	}
 	return AppendEntriesResponse{
@@ -367,7 +388,9 @@ func (n *Node) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshot
 		return InstallSnapshotResponse{Term: n.currentTerm}
 	}
 	if req.Term > n.currentTerm || n.role != Follower {
-		n.becomeFollowerLocked(req.Term, req.LeaderID)
+		if err := n.becomeFollowerLocked(req.Term, req.LeaderID); err != nil {
+			return InstallSnapshotResponse{Term: n.currentTerm}
+		}
 	}
 	n.leaderID = req.LeaderID
 	n.resetElectionLocked()
@@ -376,18 +399,46 @@ func (n *Node) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshot
 		return InstallSnapshotResponse{Term: n.currentTerm, Success: true}
 	}
 
-	n.snapshot = cloneSnapshot(req.Snapshot)
-	n.sm.Restore(req.Snapshot.Data)
-	n.dropLogThroughLocked(req.Snapshot.LastIncludedIndex)
-	if n.commitIndex < req.Snapshot.LastIncludedIndex {
-		n.commitIndex = req.Snapshot.LastIncludedIndex
+	// Persist everything to disk first, then mutate in-memory state, then restore
+	// the state machine last. Any disk failure leaves the on-disk state unchanged
+	// from the pre-call view (sm reload at startup remains correct), and any
+	// failure rolls back in-memory state so we don't report Success on a partial
+	// install.
+	newSnap := cloneSnapshot(req.Snapshot)
+	newLog := make([]storage.LogEntry, 0, len(n.log))
+	for _, entry := range n.log {
+		if entry.Index > newSnap.LastIncludedIndex {
+			newLog = append(newLog, entry)
+		}
 	}
-	if n.lastApplied < req.Snapshot.LastIncludedIndex {
-		n.lastApplied = req.Snapshot.LastIncludedIndex
+
+	if err := n.store.SaveSnapshot(newSnap); err != nil {
+		return InstallSnapshotResponse{Term: n.currentTerm}
 	}
-	n.store.SaveSnapshot(n.snapshot)
-	n.store.ReplaceEntries(n.log)
-	n.persistHardStateLocked()
+	if err := n.store.ReplaceEntries(newLog); err != nil {
+		return InstallSnapshotResponse{Term: n.currentTerm}
+	}
+
+	prevSnap := n.snapshot
+	prevLog := n.log
+	prevCommit := n.commitIndex
+	prevApplied := n.lastApplied
+	n.snapshot = newSnap
+	n.log = newLog
+	if n.commitIndex < newSnap.LastIncludedIndex {
+		n.commitIndex = newSnap.LastIncludedIndex
+	}
+	if n.lastApplied < newSnap.LastIncludedIndex {
+		n.lastApplied = newSnap.LastIncludedIndex
+	}
+	if err := n.persistHardStateLocked(); err != nil {
+		n.snapshot = prevSnap
+		n.log = prevLog
+		n.commitIndex = prevCommit
+		n.lastApplied = prevApplied
+		return InstallSnapshotResponse{Term: n.currentTerm}
+	}
+	n.sm.Restore(newSnap.Data)
 	n.notifyApplyLocked()
 	return InstallSnapshotResponse{Term: n.currentTerm, Success: true}
 }
@@ -446,6 +497,10 @@ func (n *Node) startElection() {
 		n.mu.Unlock()
 		return
 	}
+	prevRole := n.role
+	prevTerm := n.currentTerm
+	prevVotedFor := n.votedFor
+	prevLeader := n.leaderID
 	n.role = Candidate
 	n.currentTerm++
 	term := n.currentTerm
@@ -454,7 +509,16 @@ func (n *Node) startElection() {
 	n.resetElectionLocked()
 	lastIndex := n.lastIndexLocked()
 	lastTerm := n.lastTermLocked()
-	n.persistHardStateLocked()
+	if err := n.persistHardStateLocked(); err != nil {
+		// Roll back: a candidate with an unpersisted term increment could,
+		// after a crash and restart, vote a second time in the same term.
+		n.role = prevRole
+		n.currentTerm = prevTerm
+		n.votedFor = prevVotedFor
+		n.leaderID = prevLeader
+		n.mu.Unlock()
+		return
+	}
 	n.mu.Unlock()
 
 	if n.quorum() == 1 {
@@ -523,6 +587,25 @@ func (n *Node) becomeLeader(term uint64) {
 		n.nextIndex[peerID] = last + 1
 		n.matchIndex[peerID] = 0
 	}
+	// Append a no-op entry so that commitIndex can advance past any previous-term
+	// entries that this leader inherited but cannot commit directly (Raft §5.4.2
+	// / Figure 8). Without this, a linearizable read right after election can
+	// return stale data when a previous leader committed an entry that hasn't
+	// yet been applied here.
+	noop := storage.LogEntry{
+		Index:   n.lastIndexLocked() + 1,
+		Term:    term,
+		Command: storage.Command{Op: storage.OpNoop},
+	}
+	if err := n.store.AppendEntries([]storage.LogEntry{noop}); err != nil {
+		// Without the no-op, prev-term entries stay uncommitted until a future
+		// successful Propose. We remain leader but record the error.
+		n.lastErr = err
+	} else {
+		n.log = append(n.log, noop)
+		n.matchIndex[n.id] = noop.Index
+		n.nextIndex[n.id] = noop.Index + 1
+	}
 	n.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), n.timeoutMin)
@@ -533,10 +616,18 @@ func (n *Node) becomeLeader(term uint64) {
 func (n *Node) stepDown(term uint64, leaderID string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.becomeFollowerLocked(term, leaderID)
+	_ = n.becomeFollowerLocked(term, leaderID)
 }
 
-func (n *Node) becomeFollowerLocked(term uint64, leaderID string) {
+// becomeFollowerLocked transitions to follower. If persistence of the
+// (possibly new) term/votedFor fails, the in-memory term/votedFor are rolled
+// back so we never advertise a term that isn't durably recorded — preventing
+// vote duplication across a crash and restart.
+func (n *Node) becomeFollowerLocked(term uint64, leaderID string) error {
+	prevTerm := n.currentTerm
+	prevVotedFor := n.votedFor
+	prevRole := n.role
+	prevLeader := n.leaderID
 	if term > n.currentTerm {
 		n.currentTerm = term
 		n.votedFor = ""
@@ -544,7 +635,14 @@ func (n *Node) becomeFollowerLocked(term uint64, leaderID string) {
 	n.role = Follower
 	n.leaderID = leaderID
 	n.resetElectionLocked()
-	n.persistHardStateLocked()
+	if err := n.persistHardStateLocked(); err != nil {
+		n.currentTerm = prevTerm
+		n.votedFor = prevVotedFor
+		n.role = prevRole
+		n.leaderID = prevLeader
+		return err
+	}
+	return nil
 }
 
 func (n *Node) replicateAllOnce(ctx context.Context) error {
@@ -572,18 +670,23 @@ func (n *Node) replicateAllOnce(ctx context.Context) error {
 	return nil
 }
 
-func (n *Node) replicateToPeer(ctx context.Context, peerID string) {
+// replicateToPeer drives one peer's replication state forward. It returns true
+// iff at least one AppendEntries or InstallSnapshot RPC returned Success during
+// this call AND we were still leader at the same term when the ack arrived.
+// This is the per-call "did the peer just acknowledge our leadership" signal
+// ensureQuorum uses to confirm a fresh read barrier.
+func (n *Node) replicateToPeer(ctx context.Context, peerID string) bool {
 	for attempts := 0; attempts < 128; attempts++ {
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		default:
 		}
 
 		n.mu.Lock()
 		if n.role != Leader {
 			n.mu.Unlock()
-			return
+			return false
 		}
 		term := n.currentTerm
 		next := n.nextIndex[peerID]
@@ -600,19 +703,24 @@ func (n *Node) replicateToPeer(ctx context.Context, peerID string) {
 			n.mu.Unlock()
 			resp, err := n.transport.InstallSnapshot(ctx, peerID, req)
 			if err != nil {
-				return
+				return false
 			}
 			n.mu.Lock()
 			if resp.Term > n.currentTerm {
-				n.becomeFollowerLocked(resp.Term, "")
+				_ = n.becomeFollowerLocked(resp.Term, "")
 				n.mu.Unlock()
-				return
+				return false
 			}
+			acked := false
 			if n.role == Leader && n.currentTerm == term && resp.Success {
 				n.matchIndex[peerID] = req.Snapshot.LastIncludedIndex
 				n.nextIndex[peerID] = req.Snapshot.LastIncludedIndex + 1
+				acked = true
 			}
 			n.mu.Unlock()
+			if acked {
+				return true
+			}
 			continue
 		}
 
@@ -636,18 +744,18 @@ func (n *Node) replicateToPeer(ctx context.Context, peerID string) {
 
 		resp, err := n.transport.AppendEntries(ctx, peerID, req)
 		if err != nil {
-			return
+			return false
 		}
 
 		n.mu.Lock()
 		if resp.Term > n.currentTerm {
-			n.becomeFollowerLocked(resp.Term, "")
+			_ = n.becomeFollowerLocked(resp.Term, "")
 			n.mu.Unlock()
-			return
+			return false
 		}
 		if n.role != Leader || n.currentTerm != term {
 			n.mu.Unlock()
-			return
+			return false
 		}
 		if resp.Success {
 			match := prevIndex + uint64(len(entries))
@@ -655,7 +763,7 @@ func (n *Node) replicateToPeer(ctx context.Context, peerID string) {
 			n.nextIndex[peerID] = match + 1
 			n.advanceCommitLocked()
 			n.mu.Unlock()
-			return
+			return true
 		}
 		if resp.ConflictIndex > 0 {
 			n.nextIndex[peerID] = resp.ConflictIndex
@@ -664,40 +772,104 @@ func (n *Node) replicateToPeer(ctx context.Context, peerID string) {
 		}
 		n.mu.Unlock()
 	}
+	return false
 }
 
+// ensureQuorum implements the read barrier (Raft §6.4 readIndex): it dispatches
+// a fresh round of AppendEntries/InstallSnapshot RPCs and only returns nil once
+// it has confirmed acks from a current-term majority. Counting per-call ack
+// (not cumulative matchIndex) is critical — otherwise a partitioned leader can
+// pass the barrier on stale matchIndex values and serve a stale read.
 func (n *Node) ensureQuorum(ctx context.Context) error {
 	if n.quorum() == 1 {
 		return nil
 	}
 	n.mu.Lock()
+	if n.role != Leader {
+		err := n.notLeaderLocked()
+		n.mu.Unlock()
+		return err
+	}
 	term := n.currentTerm
+	peers := make([]string, 0, len(n.peerAddrs))
+	for peerID := range n.peerAddrs {
+		peers = append(peers, peerID)
+	}
 	n.mu.Unlock()
 
-	_ = n.replicateAllOnce(ctx)
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if n.role != Leader || n.currentTerm != term {
-		return n.notLeaderLocked()
-	}
-	count := 1
-	for peerID := range n.peerAddrs {
-		if n.matchIndex[peerID] >= n.commitIndex {
-			count++
+	var (
+		mu       sync.Mutex
+		acked    = 1 // count self
+		failed   = 0
+		target   = n.quorum()
+		quorumCh = make(chan struct{}, 1)
+		doneCh   = make(chan struct{}, 1)
+	)
+
+	signal := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if acked >= target {
+			select {
+			case quorumCh <- struct{}{}:
+			default:
+			}
+			return
+		}
+		// All peers responded (success or failure) and we still don't have a quorum.
+		if acked+failed >= len(peers)+1 {
+			select {
+			case doneCh <- struct{}{}:
+			default:
+			}
 		}
 	}
-	if count >= n.quorum() {
-		return nil
+
+	for _, peerID := range peers {
+		go func(peerID string) {
+			ok := n.replicateToPeer(ctx, peerID)
+			if ok {
+				n.mu.Lock()
+				stillLeader := n.role == Leader && n.currentTerm == term
+				n.mu.Unlock()
+				if !stillLeader {
+					ok = false
+				}
+			}
+			mu.Lock()
+			if ok {
+				acked++
+			} else {
+				failed++
+			}
+			mu.Unlock()
+			signal()
+		}(peerID)
 	}
-	return errors.New("leader cannot contact quorum")
+
+	select {
+	case <-quorumCh:
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		if n.role != Leader || n.currentTerm != term {
+			return n.notLeaderLocked()
+		}
+		return nil
+	case <-doneCh:
+		return errors.New("leader cannot contact quorum")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (n *Node) commitTo(index uint64) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.commitIndex < index {
+		prev := n.commitIndex
 		n.commitIndex = index
 		if err := n.persistHardStateLocked(); err != nil {
+			n.commitIndex = prev
 			return err
 		}
 		n.notifyApplyLocked()
@@ -719,8 +891,12 @@ func (n *Node) advanceCommitLocked() {
 			}
 		}
 		if count >= n.quorum() {
+			prev := n.commitIndex
 			n.commitIndex = index
-			n.persistHardStateLocked()
+			if err := n.persistHardStateLocked(); err != nil {
+				n.commitIndex = prev
+				return
+			}
 			n.notifyApplyLocked()
 			return
 		}
@@ -769,15 +945,22 @@ func (n *Node) createSnapshotLocked(index uint64) {
 		LastIncludedTerm:  term,
 		Data:              cloneMap(n.sm.Snapshot()),
 	}
-	n.snapshot = snapshot
-	n.dropLogThroughLocked(index)
+	newLog := make([]storage.LogEntry, 0, len(n.log))
+	for _, entry := range n.log {
+		if entry.Index > index {
+			newLog = append(newLog, entry)
+		}
+	}
 	if err := n.store.SaveSnapshot(snapshot); err != nil {
 		n.lastErr = err
 		return
 	}
-	if err := n.store.ReplaceEntries(n.log); err != nil {
+	if err := n.store.ReplaceEntries(newLog); err != nil {
 		n.lastErr = err
+		return
 	}
+	n.snapshot = snapshot
+	n.log = newLog
 }
 
 func (n *Node) mergeEntriesLocked(entries []storage.LogEntry) bool {
