@@ -50,6 +50,7 @@ type Config struct {
 	ElectionTimeoutMin time.Duration
 	ElectionTimeoutMax time.Duration
 	HeartbeatInterval  time.Duration
+	ReadTimeout        time.Duration
 	SnapshotThreshold  int
 	// SnapshotChunkBytes is the maximum payload of one InstallSnapshot RPC.
 	// Defaults to 1 MiB when zero or negative. Tests can shrink it to force

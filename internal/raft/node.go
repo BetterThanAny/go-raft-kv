@@ -61,6 +61,7 @@ type Node struct {
 	matchIndex         map[string]uint64
 	electionDue        time.Time
 	heartbeatEvery     time.Duration
+	readTimeout        time.Duration
 	timeoutMin         time.Duration
 	timeoutMax         time.Duration
 	snapshotEvery      int
@@ -151,6 +152,7 @@ func NewNode(cfg Config, store Store, sm StateMachine, transport Transport) (*No
 		nextIndex:          make(map[string]uint64),
 		matchIndex:         make(map[string]uint64),
 		heartbeatEvery:     cfg.HeartbeatInterval,
+		readTimeout:        cfg.ReadTimeout,
 		timeoutMin:         cfg.ElectionTimeoutMin,
 		timeoutMax:         cfg.ElectionTimeoutMax,
 		snapshotEvery:      cfg.SnapshotThreshold,
@@ -186,6 +188,9 @@ func normalizeConfig(cfg *Config) {
 	}
 	if cfg.HeartbeatInterval <= 0 {
 		cfg.HeartbeatInterval = 75 * time.Millisecond
+	}
+	if cfg.ReadTimeout <= 0 {
+		cfg.ReadTimeout = 5 * time.Second
 	}
 	if cfg.SnapshotThreshold <= 0 {
 		cfg.SnapshotThreshold = 64
@@ -316,6 +321,9 @@ func (n *Node) kickReplication() {
 }
 
 func (n *Node) LinearizableGet(ctx context.Context, key string) (string, bool, error) {
+	readCtx, cancel := n.readContext(ctx)
+	defer cancel()
+
 	n.mu.Lock()
 	if n.role != Leader {
 		err := n.notLeaderLocked()
@@ -324,7 +332,7 @@ func (n *Node) LinearizableGet(ctx context.Context, key string) (string, bool, e
 	}
 	n.mu.Unlock()
 
-	if err := n.ensureQuorum(ctx); err != nil {
+	if err := n.ensureQuorum(readCtx); err != nil {
 		return "", false, err
 	}
 
@@ -340,11 +348,21 @@ func (n *Node) LinearizableGet(ctx context.Context, key string) (string, bool, e
 	}
 	n.mu.Unlock()
 
-	if err := n.waitUntilApplied(ctx, applied); err != nil {
+	if err := n.waitUntilApplied(readCtx, applied); err != nil {
 		return "", false, err
 	}
 	value, found := readValue(n.sm, key)
 	return value, found, nil
+}
+
+func (n *Node) readContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if n.readTimeout <= 0 {
+		return ctx, func() {}
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, n.readTimeout)
 }
 
 func (n *Node) Status() Status {

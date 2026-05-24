@@ -654,6 +654,44 @@ func TestLinearizableGetWaitsForLeaderNoopApplied(t *testing.T) {
 	}
 }
 
+func TestLinearizableGetDefaultReadTimeout(t *testing.T) {
+	store := &mockStore{
+		hs: storage.HardState{CurrentTerm: 2, CommitIndex: 1},
+		entries: []storage.LogEntry{
+			{Index: 1, Term: 1, Command: storage.Command{Op: storage.OpNoop}},
+			{Index: 2, Term: 1, Command: storage.Command{Op: storage.OpPut, Key: "kept", Value: "new"}},
+			{Index: 3, Term: 2, Command: storage.Command{Op: storage.OpNoop}},
+		},
+	}
+	transport := &appendAckTransport{requests: make(chan AppendEntriesRequest, 4)}
+	node := newTestNodeWithDeps(t, store, newStubSM(), transport)
+
+	node.mu.Lock()
+	node.role = Leader
+	node.currentTerm = 2
+	node.leaderID = node.id
+	node.commitIndex = 1
+	node.lastApplied = 1
+	node.leaderNoopIndex = 3
+	node.readTimeout = 30 * time.Millisecond
+	node.matchIndex[node.id] = 3
+	node.nextIndex[node.id] = 4
+	for peerID := range node.peerAddrs {
+		node.nextIndex[peerID] = 2
+		node.matchIndex[peerID] = 0
+	}
+	node.mu.Unlock()
+
+	start := time.Now()
+	_, _, err := node.LinearizableGet(context.Background(), "kept")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected default read timeout, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("read timeout took too long: %s", elapsed)
+	}
+}
+
 func TestInstallSnapshotSerializesWithInFlightApply(t *testing.T) {
 	store := &mockStore{
 		hs: storage.HardState{CurrentTerm: 1},

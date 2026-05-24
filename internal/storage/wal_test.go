@@ -40,6 +40,86 @@ func TestStorePersistsHardStateLogAndSnapshot(t *testing.T) {
 	}
 }
 
+func TestLoadDropsUnsafeWALSuffixAfterSnapshotCrash(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveSnapshot(Snapshot{LastIncludedIndex: 8, LastIncludedTerm: 4, Data: map[string]string{"safe": "yes"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReplaceEntries([]LogEntry{
+		{Index: 9, Term: 4, Command: Command{Op: OpPut, Key: "x", Value: "9"}},
+		{Index: 10, Term: 4, Command: Command{Op: OpPut, Key: "x", Value: "10"}},
+		{Index: 11, Term: 6, Command: Command{Op: OpPut, Key: "unsafe", Value: "old-suffix"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate InstallSnapshot crashing after snapshot.json was made durable but
+	// before wal.jsonl was replaced. The old WAL has an entry at the boundary, but
+	// its term does not match the new snapshot, so the suffix cannot be trusted.
+	if err := store.SaveSnapshot(Snapshot{LastIncludedIndex: 10, LastIncludedTerm: 5, Data: map[string]string{"safe": "new"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, entries, snapshot, err := reopened.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.LastIncludedIndex != 10 || snapshot.LastIncludedTerm != 5 {
+		t.Fatalf("snapshot mismatch: %+v", snapshot)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("unsafe WAL suffix should be discarded, got %+v", entries)
+	}
+
+	again, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, entries, _, err = again.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("discarded suffix should stay discarded after rewrite, got %+v", entries)
+	}
+}
+
+func TestLoadKeepsCompactedSuffixWithMatchingWALBase(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveSnapshot(Snapshot{LastIncludedIndex: 1, LastIncludedTerm: 1, Data: map[string]string{"a": "1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReplaceEntries([]LogEntry{
+		{Index: 2, Term: 2, Command: Command{Op: OpPut, Key: "b", Value: "2"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, entries, _, err := reopened.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Index != 2 || entries[0].Term != 2 {
+		t.Fatalf("expected compacted suffix to survive, got %+v", entries)
+	}
+}
+
 // TestWALRecoversFromPartialTrailingLine simulates a crash mid-write that left
 // a truncated last line in wal.jsonl. Reading must succeed, return only the
 // complete entries, and physically truncate the partial bytes from disk.
