@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -261,14 +262,18 @@ func TestHandleInstallSnapshotRejectsWhenSaveFails(t *testing.T) {
 	node := newTestNode(t, store)
 	store.setFailSnapshot(true)
 
+	body, err := json.Marshal(map[string]string{"a": "1"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	resp := node.HandleInstallSnapshot(InstallSnapshotRequest{
-		Term:     1,
-		LeaderID: "n2",
-		Snapshot: storage.Snapshot{
-			LastIncludedIndex: 5,
-			LastIncludedTerm:  1,
-			Data:              map[string]string{"a": "1"},
-		},
+		Term:              1,
+		LeaderID:          "n2",
+		LastIncludedIndex: 5,
+		LastIncludedTerm:  1,
+		Offset:            0,
+		Data:              body,
+		Done:              true,
 	})
 
 	if resp.Success {
@@ -318,6 +323,135 @@ func TestProposeFailsWhenWALAppendFails(t *testing.T) {
 	}
 	if matchSelf != 0 {
 		t.Fatalf("matchIndex[self] must not advance when WAL append fails, got %d", matchSelf)
+	}
+}
+
+func TestHandleInstallSnapshotAssemblesMultipleChunks(t *testing.T) {
+	store := &mockStore{}
+	node := newTestNode(t, store)
+
+	full, err := json.Marshal(map[string]string{
+		"alpha": "111", "bravo": "222", "charlie": "333",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Send the snapshot in 3 chunks.
+	mid := len(full) / 3
+	send := func(offset int, body []byte, done bool) InstallSnapshotResponse {
+		return node.HandleInstallSnapshot(InstallSnapshotRequest{
+			Term:              1,
+			LeaderID:          "n2",
+			LastIncludedIndex: 9,
+			LastIncludedTerm:  1,
+			Offset:            uint64(offset),
+			Data:              body,
+			Done:              done,
+		})
+	}
+
+	resp := send(0, full[:mid], false)
+	if !resp.Success || resp.BytesReceived != uint64(mid) {
+		t.Fatalf("first chunk: %+v", resp)
+	}
+	resp = send(mid, full[mid:2*mid], false)
+	if !resp.Success || resp.BytesReceived != uint64(2*mid) {
+		t.Fatalf("second chunk: %+v", resp)
+	}
+	resp = send(2*mid, full[2*mid:], true)
+	if !resp.Success {
+		t.Fatalf("final chunk should succeed, got %+v", resp)
+	}
+
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	if node.snapshot.LastIncludedIndex != 9 {
+		t.Fatalf("snapshot not installed: %+v", node.snapshot)
+	}
+	if got := node.snapshot.Data["alpha"]; got != "111" {
+		t.Fatalf("snapshot data missing alpha: %v", node.snapshot.Data)
+	}
+	if node.pendingSnapshot != nil {
+		t.Fatal("pendingSnapshot should be cleared after install")
+	}
+}
+
+func TestHandleInstallSnapshotReportsOffsetMismatch(t *testing.T) {
+	store := &mockStore{}
+	node := newTestNode(t, store)
+
+	// Seed the first chunk so we have 100 bytes buffered.
+	first := make([]byte, 100)
+	for i := range first {
+		first[i] = '{'
+	}
+	resp := node.HandleInstallSnapshot(InstallSnapshotRequest{
+		Term:              1,
+		LeaderID:          "n2",
+		LastIncludedIndex: 9,
+		LastIncludedTerm:  1,
+		Offset:            0,
+		Data:              first,
+		Done:              false,
+	})
+	if !resp.Success || resp.BytesReceived != 100 {
+		t.Fatalf("first chunk: %+v", resp)
+	}
+
+	// Leader retries from offset=42 (wrong). Follower should answer with the
+	// next expected offset (100) so the leader can resume from the right place.
+	resp = node.HandleInstallSnapshot(InstallSnapshotRequest{
+		Term:              1,
+		LeaderID:          "n2",
+		LastIncludedIndex: 9,
+		LastIncludedTerm:  1,
+		Offset:            42,
+		Data:              []byte("garbage"),
+		Done:              false,
+	})
+	if resp.Success {
+		t.Fatal("offset-mismatched chunk must not be accepted")
+	}
+	if resp.BytesReceived != 100 {
+		t.Fatalf("expected BytesReceived=100, got %d", resp.BytesReceived)
+	}
+}
+
+func TestHandleInstallSnapshotDiscardsStalePending(t *testing.T) {
+	store := &mockStore{}
+	node := newTestNode(t, store)
+
+	// Begin streaming snapshot at index=5.
+	_ = node.HandleInstallSnapshot(InstallSnapshotRequest{
+		Term:              1,
+		LeaderID:          "n2",
+		LastIncludedIndex: 5,
+		LastIncludedTerm:  1,
+		Offset:            0,
+		Data:              []byte("partial"),
+		Done:              false,
+	})
+
+	// A new snapshot at index=12 arrives at offset=0 — should discard the
+	// in-flight one and start fresh.
+	body, _ := json.Marshal(map[string]string{"k": "v"})
+	resp := node.HandleInstallSnapshot(InstallSnapshotRequest{
+		Term:              1,
+		LeaderID:          "n2",
+		LastIncludedIndex: 12,
+		LastIncludedTerm:  1,
+		Offset:            0,
+		Data:              body,
+		Done:              true,
+	})
+	if !resp.Success {
+		t.Fatalf("new snapshot at offset 0 must succeed: %+v", resp)
+	}
+
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	if node.snapshot.LastIncludedIndex != 12 {
+		t.Fatalf("expected snapshot 12 to be installed, got %d", node.snapshot.LastIncludedIndex)
 	}
 }
 

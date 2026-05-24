@@ -51,6 +51,10 @@ type Config struct {
 	ElectionTimeoutMax time.Duration
 	HeartbeatInterval  time.Duration
 	SnapshotThreshold  int
+	// SnapshotChunkBytes is the maximum payload of one InstallSnapshot RPC.
+	// Defaults to 1 MiB when zero or negative. Tests can shrink it to force
+	// multi-chunk transfers over small state.
+	SnapshotChunkBytes int
 }
 
 type RequestVoteRequest struct {
@@ -81,15 +85,27 @@ type AppendEntriesResponse struct {
 	ConflictIndex uint64 `json:"conflict_index,omitempty"`
 }
 
+// InstallSnapshotRequest carries one chunk of a snapshot. The snapshot body is
+// serialized once by the leader and sent in fixed-size chunks. (LeaderID,
+// LastIncludedIndex, LastIncludedTerm) identifies the snapshot stream so the
+// follower can detect a switch to a newer snapshot mid-transfer.
 type InstallSnapshotRequest struct {
-	Term     uint64           `json:"term"`
-	LeaderID string           `json:"leader_id"`
-	Snapshot storage.Snapshot `json:"snapshot"`
+	Term              uint64 `json:"term"`
+	LeaderID          string `json:"leader_id"`
+	LastIncludedIndex uint64 `json:"last_included_index"`
+	LastIncludedTerm  uint64 `json:"last_included_term"`
+	Offset            uint64 `json:"offset"`
+	Data              []byte `json:"data"`
+	Done              bool   `json:"done"`
 }
 
 type InstallSnapshotResponse struct {
 	Term    uint64 `json:"term"`
 	Success bool   `json:"success"`
+	// BytesReceived is the next offset the follower expects, so a leader that
+	// observes an offset mismatch (e.g. after the follower restarted in
+	// mid-transfer) can resume from the right place.
+	BytesReceived uint64 `json:"bytes_received,omitempty"`
 }
 
 type Transport interface {

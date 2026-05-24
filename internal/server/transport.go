@@ -104,15 +104,21 @@ func (t *GRPCTransport) InstallSnapshot(ctx context.Context, peerID string, req 
 	resp, err := client.InstallSnapshot(ctx, &api.InstallSnapshotRequest{
 		Term:              req.Term,
 		LeaderID:          req.LeaderID,
-		LastIncludedIndex: req.Snapshot.LastIncludedIndex,
-		LastIncludedTerm:  req.Snapshot.LastIncludedTerm,
-		Data:              req.Snapshot.Data,
+		LastIncludedIndex: req.LastIncludedIndex,
+		LastIncludedTerm:  req.LastIncludedTerm,
+		Offset:            req.Offset,
+		Data:              req.Data,
+		Done:              req.Done,
 	})
 	if err != nil {
 		t.dropConn(peerID, conn)
 		return raft.InstallSnapshotResponse{}, err
 	}
-	return raft.InstallSnapshotResponse{Term: resp.Term, Success: resp.Success}, nil
+	return raft.InstallSnapshotResponse{
+		Term:          resp.Term,
+		Success:       resp.Success,
+		BytesReceived: resp.BytesReceived,
+	}, nil
 }
 
 // connFor returns a cached gRPC client connection to the peer, dialing

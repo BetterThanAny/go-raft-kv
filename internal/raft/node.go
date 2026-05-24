@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"hash/fnv"
 	"math/rand"
@@ -20,6 +21,22 @@ type applyOutcome struct {
 	// only signals that the command itself was rejected by the state machine).
 	err error
 }
+
+// snapshotProgress holds the partial bytes a follower has received while a
+// chunked InstallSnapshot is in flight. A snapshot is identified by its
+// leader-supplied (lastIncludedIndex, lastIncludedTerm) — a new pair from any
+// leader invalidates the current progress.
+type snapshotProgress struct {
+	leaderID          string
+	lastIncludedIndex uint64
+	lastIncludedTerm  uint64
+	buffer            []byte
+}
+
+// snapshotChunkBytes is the maximum payload of one InstallSnapshot RPC.
+// Configurable per Node via Config.SnapshotChunkBytes; falls back to this
+// default if unset.
+const defaultSnapshotChunkBytes = 1 << 20 // 1 MiB
 
 type Node struct {
 	id          string
@@ -45,10 +62,12 @@ type Node struct {
 	heartbeatEvery time.Duration
 	timeoutMin     time.Duration
 	timeoutMax     time.Duration
-	snapshotEvery  int
-	rng            *rand.Rand
-	waiters        map[uint64][]chan applyOutcome
-	lastErr        error
+	snapshotEvery      int
+	snapshotChunkBytes int
+	rng                *rand.Rand
+	waiters            map[uint64][]chan applyOutcome
+	pendingSnapshot    *snapshotProgress
+	lastErr            error
 
 	proposeMu   sync.Mutex
 	applyCh     chan struct{}
@@ -130,7 +149,8 @@ func NewNode(cfg Config, store Store, sm StateMachine, transport Transport) (*No
 		heartbeatEvery: cfg.HeartbeatInterval,
 		timeoutMin:     cfg.ElectionTimeoutMin,
 		timeoutMax:     cfg.ElectionTimeoutMax,
-		snapshotEvery:  cfg.SnapshotThreshold,
+		snapshotEvery:      cfg.SnapshotThreshold,
+		snapshotChunkBytes: cfg.SnapshotChunkBytes,
 		rng:            rand.New(rand.NewSource(time.Now().UnixNano() + int64(hashID(cfg.ID)))),
 		waiters:        make(map[uint64][]chan applyOutcome),
 		applyCh:        make(chan struct{}, 1),
@@ -164,6 +184,9 @@ func normalizeConfig(cfg *Config) {
 	}
 	if cfg.SnapshotThreshold <= 0 {
 		cfg.SnapshotThreshold = 64
+	}
+	if cfg.SnapshotChunkBytes <= 0 {
+		cfg.SnapshotChunkBytes = defaultSnapshotChunkBytes
 	}
 }
 
@@ -423,16 +446,64 @@ func (n *Node) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshot
 	n.leaderID = req.LeaderID
 	n.resetElectionLocked()
 
-	if req.Snapshot.LastIncludedIndex <= n.snapshot.LastIncludedIndex {
+	if req.LastIncludedIndex <= n.snapshot.LastIncludedIndex {
+		// Already at or beyond this snapshot — discard any pending stream and
+		// ack so the leader stops re-sending.
+		n.pendingSnapshot = nil
 		return InstallSnapshotResponse{Term: n.currentTerm, Success: true}
 	}
 
-	// Persist everything to disk first, then mutate in-memory state, then restore
-	// the state machine last. Any disk failure leaves the on-disk state unchanged
-	// from the pre-call view (sm reload at startup remains correct), and any
-	// failure rolls back in-memory state so we don't report Success on a partial
-	// install.
-	newSnap := cloneSnapshot(req.Snapshot)
+	progress := n.pendingSnapshot
+	if progress == nil ||
+		progress.leaderID != req.LeaderID ||
+		progress.lastIncludedIndex != req.LastIncludedIndex ||
+		progress.lastIncludedTerm != req.LastIncludedTerm {
+		// Either no in-progress stream, or this chunk belongs to a different
+		// snapshot (newer leader, newer snapshot). Start over only if the
+		// chunk itself is at offset 0; otherwise tell the leader we need 0.
+		if req.Offset != 0 {
+			return InstallSnapshotResponse{Term: n.currentTerm, BytesReceived: 0}
+		}
+		progress = &snapshotProgress{
+			leaderID:          req.LeaderID,
+			lastIncludedIndex: req.LastIncludedIndex,
+			lastIncludedTerm:  req.LastIncludedTerm,
+		}
+		n.pendingSnapshot = progress
+	}
+
+	if req.Offset != uint64(len(progress.buffer)) {
+		// Out-of-order chunk — likely from a retry. Tell the leader the actual
+		// progress so it can resume from there.
+		return InstallSnapshotResponse{
+			Term:          n.currentTerm,
+			BytesReceived: uint64(len(progress.buffer)),
+		}
+	}
+	progress.buffer = append(progress.buffer, req.Data...)
+
+	if !req.Done {
+		return InstallSnapshotResponse{
+			Term:          n.currentTerm,
+			Success:       true,
+			BytesReceived: uint64(len(progress.buffer)),
+		}
+	}
+
+	// Final chunk: decode, persist disk-first, then mutate memory, then
+	// restore the state machine.
+	var data map[string]string
+	if len(progress.buffer) > 0 {
+		if err := json.Unmarshal(progress.buffer, &data); err != nil {
+			n.pendingSnapshot = nil
+			return InstallSnapshotResponse{Term: n.currentTerm}
+		}
+	}
+	newSnap := storage.Snapshot{
+		LastIncludedIndex: req.LastIncludedIndex,
+		LastIncludedTerm:  req.LastIncludedTerm,
+		Data:              data,
+	}
 	newLog := make([]storage.LogEntry, 0, len(n.log))
 	for _, entry := range n.log {
 		if entry.Index > newSnap.LastIncludedIndex {
@@ -467,8 +538,13 @@ func (n *Node) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshot
 		return InstallSnapshotResponse{Term: n.currentTerm}
 	}
 	n.sm.Restore(newSnap.Data)
+	n.pendingSnapshot = nil
 	n.notifyApplyLocked()
-	return InstallSnapshotResponse{Term: n.currentTerm, Success: true}
+	return InstallSnapshotResponse{
+		Term:          n.currentTerm,
+		Success:       true,
+		BytesReceived: uint64(len(progress.buffer)),
+	}
 }
 
 func (n *Node) electionLoop() {
@@ -752,33 +828,25 @@ func (n *Node) replicateToPeer(ctx context.Context, peerID string) bool {
 			n.nextIndex[peerID] = next
 		}
 		if next <= n.snapshot.LastIncludedIndex {
-			req := InstallSnapshotRequest{
-				Term:     term,
-				LeaderID: n.id,
-				Snapshot: cloneSnapshot(n.snapshot),
-			}
+			snapIdx := n.snapshot.LastIncludedIndex
+			snapTerm := n.snapshot.LastIncludedTerm
+			chunkSize := n.snapshotChunkBytes
+			snapData := cloneMap(n.snapshot.Data)
 			n.mu.Unlock()
-			resp, err := n.transport.InstallSnapshot(ctx, peerID, req)
-			if err != nil {
+			if !n.sendSnapshot(ctx, peerID, term, snapIdx, snapTerm, snapData, chunkSize) {
 				return false
 			}
 			n.mu.Lock()
-			if resp.Term > n.currentTerm {
-				_ = n.becomeFollowerLocked(resp.Term, "")
-				n.mu.Unlock()
-				return false
-			}
-			acked := false
-			if n.role == Leader && n.currentTerm == term && resp.Success {
-				n.matchIndex[peerID] = req.Snapshot.LastIncludedIndex
-				n.nextIndex[peerID] = req.Snapshot.LastIncludedIndex + 1
-				acked = true
+			if n.role == Leader && n.currentTerm == term {
+				if n.matchIndex[peerID] < snapIdx {
+					n.matchIndex[peerID] = snapIdx
+				}
+				if n.nextIndex[peerID] < snapIdx+1 {
+					n.nextIndex[peerID] = snapIdx + 1
+				}
 			}
 			n.mu.Unlock()
-			if acked {
-				return true
-			}
-			continue
+			return true
 		}
 
 		prevIndex := next - 1
@@ -830,6 +898,73 @@ func (n *Node) replicateToPeer(ctx context.Context, peerID string) bool {
 		n.mu.Unlock()
 	}
 	return false
+}
+
+// sendSnapshot streams the current snapshot to a peer in chunks of at most
+// chunkSize bytes. Returns true only when the follower acks the final chunk.
+// Caller must hold no locks; we re-acquire n.mu only for term/role checks.
+func (n *Node) sendSnapshot(ctx context.Context, peerID string, term, lastIdx, lastTerm uint64, data map[string]string, chunkSize int) bool {
+	body, err := json.Marshal(data)
+	if err != nil {
+		return false
+	}
+	if chunkSize <= 0 {
+		chunkSize = defaultSnapshotChunkBytes
+	}
+	offset := uint64(0)
+	total := uint64(len(body))
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+		end := offset + uint64(chunkSize)
+		if end > total {
+			end = total
+		}
+		done := end == total
+		req := InstallSnapshotRequest{
+			Term:              term,
+			LeaderID:          n.id,
+			LastIncludedIndex: lastIdx,
+			LastIncludedTerm:  lastTerm,
+			Offset:            offset,
+			Data:              body[offset:end],
+			Done:              done,
+		}
+		resp, err := n.transport.InstallSnapshot(ctx, peerID, req)
+		if err != nil {
+			return false
+		}
+		n.mu.Lock()
+		if resp.Term > n.currentTerm {
+			_ = n.becomeFollowerLocked(resp.Term, "")
+			n.mu.Unlock()
+			return false
+		}
+		if n.role != Leader || n.currentTerm != term {
+			n.mu.Unlock()
+			return false
+		}
+		n.mu.Unlock()
+		if !resp.Success {
+			// Follower told us the next offset it wants. Resume from there.
+			// If the same offset comes back twice, give up to avoid a loop.
+			if resp.BytesReceived == offset && !done {
+				return false
+			}
+			offset = resp.BytesReceived
+			if offset > total {
+				return false
+			}
+			continue
+		}
+		if done {
+			return true
+		}
+		offset = end
+	}
 }
 
 // ensureQuorum implements the read barrier (Raft §6.4 readIndex): it dispatches

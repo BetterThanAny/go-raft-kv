@@ -15,14 +15,15 @@ import (
 )
 
 type memoryCluster struct {
-	t      testing.TB
-	root   string
-	peers  map[string]string
-	client map[string]string
-	net    *memoryTransport
-	mu     sync.RWMutex
-	nodes  map[string]*clusterNode
-	alive  map[string]bool
+	t                  testing.TB
+	root               string
+	peers              map[string]string
+	client             map[string]string
+	net                *memoryTransport
+	mu                 sync.RWMutex
+	nodes              map[string]*clusterNode
+	alive              map[string]bool
+	snapshotChunkBytes int
 }
 
 type clusterNode struct {
@@ -110,6 +111,48 @@ func TestSnapshotCompactionAndRestartRecovery(t *testing.T) {
 	cluster.waitValue(t, leaderID, "k:09", "v:09")
 }
 
+// TestFollowerCatchesUpViaChunkedInstallSnapshot stops a follower, advances
+// the leader far enough to trigger snapshot compaction, then restarts the
+// follower and verifies it catches up via the chunked InstallSnapshot path.
+// SnapshotChunkBytes is set tiny so the snapshot bytes split into many chunks
+// — the test fails if the leader can't stream them or the follower can't
+// reassemble them.
+func TestFollowerCatchesUpViaChunkedInstallSnapshot(t *testing.T) {
+	cluster := newMemoryClusterWithChunkBytes(t, 3, 3, 8)
+	defer cluster.stopAll()
+
+	leaderID, leader := cluster.waitLeader(t, "")
+	var followerID string
+	for id := range cluster.nodes {
+		if id != leaderID {
+			followerID = id
+			break
+		}
+	}
+	cluster.stopNode(followerID)
+
+	for i := 0; i < 12; i++ {
+		proposePut(t, leader, fmt.Sprintf("k:%02d", i), fmt.Sprintf("v:%02d", i))
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if leader.Status().SnapshotIndex > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if leader.Status().SnapshotIndex == 0 {
+		t.Fatal("expected leader snapshot to advance before catching up follower")
+	}
+
+	cluster.restartNode(t, followerID)
+
+	for i := 0; i < 12; i++ {
+		cluster.waitValue(t, followerID, fmt.Sprintf("k:%02d", i), fmt.Sprintf("v:%02d", i))
+	}
+}
+
 // TestLinearizableGetAfterLeaderChange verifies a freshly elected leader can
 // serve a linearizable read of a value committed by the previous leader without
 // requiring a fresh client write. This exercises the no-op-on-becomeLeader path
@@ -193,15 +236,20 @@ func BenchmarkSingleNodePut(b *testing.B) {
 }
 
 func newMemoryCluster(t testing.TB, size int, snapshotThreshold int) *memoryCluster {
+	return newMemoryClusterWithChunkBytes(t, size, snapshotThreshold, 0)
+}
+
+func newMemoryClusterWithChunkBytes(t testing.TB, size int, snapshotThreshold, chunkBytes int) *memoryCluster {
 	t.Helper()
 
 	cluster := &memoryCluster{
-		t:      t,
-		root:   t.TempDir(),
-		peers:  make(map[string]string),
-		client: make(map[string]string),
-		nodes:  make(map[string]*clusterNode),
-		alive:  make(map[string]bool),
+		t:                  t,
+		root:               t.TempDir(),
+		peers:              make(map[string]string),
+		client:             make(map[string]string),
+		nodes:              make(map[string]*clusterNode),
+		alive:              make(map[string]bool),
+		snapshotChunkBytes: chunkBytes,
 	}
 	cluster.net = &memoryTransport{cluster: cluster}
 	for i := 1; i <= size; i++ {
@@ -242,6 +290,7 @@ func (c *memoryCluster) newNode(t testing.TB, id string, snapshotThreshold int) 
 		ElectionTimeoutMax: 160 * time.Millisecond,
 		HeartbeatInterval:  20 * time.Millisecond,
 		SnapshotThreshold:  snapshotThreshold,
+		SnapshotChunkBytes: c.snapshotChunkBytes,
 	}, store, sm, c.net)
 	if err != nil {
 		t.Fatal(err)

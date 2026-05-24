@@ -140,16 +140,19 @@ type AppendEntriesResponse struct {
 }
 
 type InstallSnapshotRequest struct {
-	Term              uint64            `json:"term"`
-	LeaderID          string            `json:"leader_id"`
-	LastIncludedIndex uint64            `json:"last_included_index"`
-	LastIncludedTerm  uint64            `json:"last_included_term"`
-	Data              map[string]string `json:"data"`
+	Term              uint64 `json:"term"`
+	LeaderID          string `json:"leader_id"`
+	LastIncludedIndex uint64 `json:"last_included_index"`
+	LastIncludedTerm  uint64 `json:"last_included_term"`
+	Offset            uint64 `json:"offset"`
+	Data              []byte `json:"data"`
+	Done              bool   `json:"done"`
 }
 
 type InstallSnapshotResponse struct {
-	Term    uint64 `json:"term"`
-	Success bool   `json:"success"`
+	Term          uint64 `json:"term"`
+	Success       bool   `json:"success"`
+	BytesReceived uint64 `json:"bytes_received,omitempty"`
 }
 
 type KVServiceServer interface {

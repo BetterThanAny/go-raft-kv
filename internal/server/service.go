@@ -102,15 +102,19 @@ func (s *Service) AppendEntries(ctx context.Context, req *api.AppendEntriesReque
 
 func (s *Service) InstallSnapshot(ctx context.Context, req *api.InstallSnapshotRequest) (*api.InstallSnapshotResponse, error) {
 	resp := s.node.HandleInstallSnapshot(raft.InstallSnapshotRequest{
-		Term:     req.Term,
-		LeaderID: req.LeaderID,
-		Snapshot: storage.Snapshot{
-			LastIncludedIndex: req.LastIncludedIndex,
-			LastIncludedTerm:  req.LastIncludedTerm,
-			Data:              req.Data,
-		},
+		Term:              req.Term,
+		LeaderID:          req.LeaderID,
+		LastIncludedIndex: req.LastIncludedIndex,
+		LastIncludedTerm:  req.LastIncludedTerm,
+		Offset:            req.Offset,
+		Data:              req.Data,
+		Done:              req.Done,
 	})
-	return &api.InstallSnapshotResponse{Term: resp.Term, Success: resp.Success}, nil
+	return &api.InstallSnapshotResponse{
+		Term:          resp.Term,
+		Success:       resp.Success,
+		BytesReceived: resp.BytesReceived,
+	}, nil
 }
 
 func logEntriesToAPI(entries []storage.LogEntry) []api.LogEntry {
