@@ -356,7 +356,7 @@ func (c *memoryCluster) waitLeader(t testing.TB, exclude string) (string, *raft.
 				continue
 			}
 			status := node.node.Status()
-			if status.Role == raft.Leader {
+			if status.Role == raft.Leader && status.CommitIndex >= status.LastLogIndex {
 				return id, node.node
 			}
 		}

@@ -157,10 +157,6 @@ func status(ctx context.Context, endpoints []string) error {
 	return enc.Encode(statuses)
 }
 
-type leaderResponse interface {
-	leader() (bool, string)
-}
-
 func withLeaderRetry[T any](ctx context.Context, endpoints []string, fn func(context.Context, *api.KVClient) (T, error)) (T, error) {
 	var zero T
 	queue := append([]string(nil), endpoints...)
@@ -178,7 +174,11 @@ func withLeaderRetry[T any](ctx context.Context, endpoints []string, fn func(con
 			lastErr = err
 			continue
 		}
-		if ok, leaderAddr := leaderFrom(resp); !ok && leaderAddr != "" {
+		ok, leaderAddr, err := leaderFrom(resp)
+		if err != nil {
+			return zero, err
+		}
+		if !ok && leaderAddr != "" {
 			queue = append(queue, leaderAddr)
 			continue
 		}
@@ -202,18 +202,18 @@ func call[T any](ctx context.Context, endpoint string, fn func(context.Context, 
 	return fn(callCtx, api.NewKVClient(conn))
 }
 
-func leaderFrom(resp any) (bool, string) {
+func leaderFrom(resp any) (bool, string, error) {
 	switch v := resp.(type) {
 	case *api.PutResponse:
-		return v.OK, v.LeaderAddress
+		return v.OK, v.LeaderAddress, nil
 	case *api.GetResponse:
-		return v.OK, v.LeaderAddress
+		return v.OK, v.LeaderAddress, nil
 	case *api.DeleteResponse:
-		return v.OK, v.LeaderAddress
+		return v.OK, v.LeaderAddress, nil
 	case *api.CASResponse:
-		return v.OK, v.LeaderAddress
+		return v.OK, v.LeaderAddress, nil
 	default:
-		return true, ""
+		return false, "", fmt.Errorf("response %T does not carry a leader hint", resp)
 	}
 }
 

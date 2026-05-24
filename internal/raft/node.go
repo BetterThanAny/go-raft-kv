@@ -47,34 +47,38 @@ type Node struct {
 	store       Store
 	sm          StateMachine
 
-	mu             sync.Mutex
-	role           Role
-	currentTerm    uint64
-	votedFor       string
-	leaderID       string
-	log            []storage.LogEntry
-	snapshot       storage.Snapshot
-	commitIndex    uint64
-	lastApplied    uint64
-	nextIndex      map[string]uint64
-	matchIndex     map[string]uint64
-	electionDue    time.Time
-	heartbeatEvery time.Duration
-	timeoutMin     time.Duration
-	timeoutMax     time.Duration
+	mu                 sync.Mutex
+	role               Role
+	currentTerm        uint64
+	votedFor           string
+	leaderID           string
+	log                []storage.LogEntry
+	snapshot           storage.Snapshot
+	commitIndex        uint64
+	lastApplied        uint64
+	leaderNoopIndex    uint64
+	nextIndex          map[string]uint64
+	matchIndex         map[string]uint64
+	electionDue        time.Time
+	heartbeatEvery     time.Duration
+	timeoutMin         time.Duration
+	timeoutMax         time.Duration
 	snapshotEvery      int
 	snapshotChunkBytes int
 	rng                *rand.Rand
 	waiters            map[uint64][]chan applyOutcome
 	pendingSnapshot    *snapshotProgress
 	lastErr            error
+	storageFatal       error
 
-	proposeMu   sync.Mutex
-	applyCh     chan struct{}
-	replicateCh chan struct{}
-	stopCh      chan struct{}
-	stopOnce    sync.Once
-	loops       sync.WaitGroup
+	proposeMu         sync.Mutex
+	snapshotPersistMu sync.Mutex
+	applyCond         *sync.Cond
+	applyCh           chan struct{}
+	replicateCh       chan struct{}
+	stopCh            chan struct{}
+	stopOnce          sync.Once
+	loops             sync.WaitGroup
 }
 
 func NewNode(cfg Config, store Store, sm StateMachine, transport Transport) (*Node, error) {
@@ -130,33 +134,34 @@ func NewNode(cfg Config, store Store, sm StateMachine, transport Transport) (*No
 	}
 
 	n := &Node{
-		id:             cfg.ID,
-		address:        cfg.Address,
-		peerAddrs:      peerAddrs,
-		clientAddrs:    clientAddrs,
-		transport:      transport,
-		store:          store,
-		sm:             sm,
-		role:           Follower,
-		currentTerm:    hs.CurrentTerm,
-		votedFor:       hs.VotedFor,
-		log:            append([]storage.LogEntry(nil), entries...),
-		snapshot:       cloneSnapshot(snapshot),
-		commitIndex:    commitIndex,
-		lastApplied:    lastApplied,
-		nextIndex:      make(map[string]uint64),
-		matchIndex:     make(map[string]uint64),
-		heartbeatEvery: cfg.HeartbeatInterval,
-		timeoutMin:     cfg.ElectionTimeoutMin,
-		timeoutMax:     cfg.ElectionTimeoutMax,
+		id:                 cfg.ID,
+		address:            cfg.Address,
+		peerAddrs:          peerAddrs,
+		clientAddrs:        clientAddrs,
+		transport:          transport,
+		store:              store,
+		sm:                 sm,
+		role:               Follower,
+		currentTerm:        hs.CurrentTerm,
+		votedFor:           hs.VotedFor,
+		log:                append([]storage.LogEntry(nil), entries...),
+		snapshot:           cloneSnapshot(snapshot),
+		commitIndex:        commitIndex,
+		lastApplied:        lastApplied,
+		nextIndex:          make(map[string]uint64),
+		matchIndex:         make(map[string]uint64),
+		heartbeatEvery:     cfg.HeartbeatInterval,
+		timeoutMin:         cfg.ElectionTimeoutMin,
+		timeoutMax:         cfg.ElectionTimeoutMax,
 		snapshotEvery:      cfg.SnapshotThreshold,
 		snapshotChunkBytes: cfg.SnapshotChunkBytes,
-		rng:            rand.New(rand.NewSource(time.Now().UnixNano() + int64(hashID(cfg.ID)))),
-		waiters:        make(map[uint64][]chan applyOutcome),
-		applyCh:        make(chan struct{}, 1),
-		replicateCh:    make(chan struct{}, 1),
-		stopCh:         make(chan struct{}),
+		rng:                rand.New(rand.NewSource(time.Now().UnixNano() + int64(hashID(cfg.ID)))),
+		waiters:            make(map[uint64][]chan applyOutcome),
+		applyCh:            make(chan struct{}, 1),
+		replicateCh:        make(chan struct{}, 1),
+		stopCh:             make(chan struct{}),
 	}
+	n.applyCond = sync.NewCond(&n.mu)
 	n.resetElectionLocked()
 	if hs.CommitIndex != commitIndex {
 		if err := n.persistHardStateLocked(); err != nil {
@@ -235,17 +240,26 @@ func (n *Node) Propose(ctx context.Context, command storage.Command) (storage.Ap
 
 	select {
 	case outcome := <-waiter:
-		if outcome.err != nil {
-			return storage.ApplyResult{}, outcome.err
-		}
-		if !outcome.result.OK && outcome.result.Error != "" {
-			return outcome.result, errors.New(outcome.result.Error)
-		}
-		return outcome.result, nil
+		return resultFromOutcome(outcome)
 	case <-ctx.Done():
 		n.removeWaiter(index, waiter)
+		select {
+		case outcome := <-waiter:
+			return resultFromOutcome(outcome)
+		default:
+		}
 		return storage.ApplyResult{}, ctx.Err()
 	}
+}
+
+func resultFromOutcome(outcome applyOutcome) (storage.ApplyResult, error) {
+	if outcome.err != nil {
+		return storage.ApplyResult{}, outcome.err
+	}
+	if !outcome.result.OK && outcome.result.Error != "" {
+		return outcome.result, errors.New(outcome.result.Error)
+	}
+	return outcome.result, nil
 }
 
 // proposeAppend atomically allocates the next log index, persists the entry to
@@ -259,6 +273,11 @@ func (n *Node) proposeAppend(command storage.Command) (chan applyOutcome, uint64
 	defer n.proposeMu.Unlock()
 
 	n.mu.Lock()
+	if n.storageFatal != nil {
+		err := n.storageFatal
+		n.mu.Unlock()
+		return nil, 0, err
+	}
 	if n.role != Leader {
 		err := n.notLeaderLocked()
 		n.mu.Unlock()
@@ -272,6 +291,7 @@ func (n *Node) proposeAppend(command storage.Command) (chan applyOutcome, uint64
 	// Persist to WAL before any in-memory mutation. proposeMu ensures index
 	// monotonicity across concurrent calls so the WAL is always append-ordered.
 	if err := n.store.AppendEntries([]storage.LogEntry{entry}); err != nil {
+		n.failStorageLocked(err)
 		n.mu.Unlock()
 		return nil, 0, err
 	}
@@ -302,12 +322,24 @@ func (n *Node) LinearizableGet(ctx context.Context, key string) (string, bool, e
 		n.mu.Unlock()
 		return "", false, err
 	}
-	applied := n.commitIndex
 	n.mu.Unlock()
 
 	if err := n.ensureQuorum(ctx); err != nil {
 		return "", false, err
 	}
+
+	n.mu.Lock()
+	if n.role != Leader {
+		err := n.notLeaderLocked()
+		n.mu.Unlock()
+		return "", false, err
+	}
+	applied := n.commitIndex
+	if n.leaderNoopIndex > applied {
+		applied = n.leaderNoopIndex
+	}
+	n.mu.Unlock()
+
 	if err := n.waitUntilApplied(ctx, applied); err != nil {
 		return "", false, err
 	}
@@ -349,6 +381,9 @@ func (n *Node) HandleRequestVote(req RequestVoteRequest) RequestVoteResponse {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	if n.storageFatal != nil {
+		return RequestVoteResponse{Term: n.currentTerm}
+	}
 	if req.Term < n.currentTerm {
 		return RequestVoteResponse{Term: n.currentTerm}
 	}
@@ -380,6 +415,9 @@ func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRespon
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	if n.storageFatal != nil {
+		return AppendEntriesResponse{Term: n.currentTerm, LastLogIndex: n.lastIndexLocked()}
+	}
 	if req.Term < n.currentTerm {
 		return AppendEntriesResponse{Term: n.currentTerm, LastLogIndex: n.lastIndexLocked()}
 	}
@@ -412,6 +450,7 @@ func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRespon
 	if changed {
 		if err := n.store.ReplaceEntries(n.log); err != nil {
 			n.log = prevLog
+			n.failStorageLocked(err)
 			return AppendEntriesResponse{Term: n.currentTerm, LastLogIndex: n.lastIndexLocked()}
 		}
 	}
@@ -432,9 +471,15 @@ func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRespon
 }
 
 func (n *Node) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshotResponse {
+	n.snapshotPersistMu.Lock()
+	defer n.snapshotPersistMu.Unlock()
+
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	if n.storageFatal != nil {
+		return InstallSnapshotResponse{Term: n.currentTerm}
+	}
 	if req.Term < n.currentTerm {
 		return InstallSnapshotResponse{Term: n.currentTerm}
 	}
@@ -446,9 +491,9 @@ func (n *Node) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshot
 	n.leaderID = req.LeaderID
 	n.resetElectionLocked()
 
-	if req.LastIncludedIndex <= n.snapshot.LastIncludedIndex {
-		// Already at or beyond this snapshot — discard any pending stream and
-		// ack so the leader stops re-sending.
+	if req.LastIncludedIndex <= n.lastApplied {
+		// Already applied at or beyond this snapshot. Installing it would roll the
+		// state machine back, so ack it as stale and let the leader advance.
 		n.pendingSnapshot = nil
 		return InstallSnapshotResponse{Term: n.currentTerm, Success: true}
 	}
@@ -504,12 +549,7 @@ func (n *Node) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshot
 		LastIncludedTerm:  req.LastIncludedTerm,
 		Data:              data,
 	}
-	newLog := make([]storage.LogEntry, 0, len(n.log))
-	for _, entry := range n.log {
-		if entry.Index > newSnap.LastIncludedIndex {
-			newLog = append(newLog, entry)
-		}
-	}
+	newLog := n.logAfterSnapshotLocked(newSnap)
 
 	if err := n.store.SaveSnapshot(newSnap); err != nil {
 		return InstallSnapshotResponse{Term: n.currentTerm}
@@ -518,10 +558,6 @@ func (n *Node) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshot
 		return InstallSnapshotResponse{Term: n.currentTerm}
 	}
 
-	prevSnap := n.snapshot
-	prevLog := n.log
-	prevCommit := n.commitIndex
-	prevApplied := n.lastApplied
 	n.snapshot = newSnap
 	n.log = newLog
 	if n.commitIndex < newSnap.LastIncludedIndex {
@@ -529,16 +565,14 @@ func (n *Node) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshot
 	}
 	if n.lastApplied < newSnap.LastIncludedIndex {
 		n.lastApplied = newSnap.LastIncludedIndex
-	}
-	if err := n.persistHardStateLocked(); err != nil {
-		n.snapshot = prevSnap
-		n.log = prevLog
-		n.commitIndex = prevCommit
-		n.lastApplied = prevApplied
-		return InstallSnapshotResponse{Term: n.currentTerm}
+		n.applyCond.Broadcast()
 	}
 	n.sm.Restore(newSnap.Data)
 	n.pendingSnapshot = nil
+	if err := n.persistHardStateLocked(); err != nil {
+		n.failStorageLocked(err)
+		return InstallSnapshotResponse{Term: n.currentTerm}
+	}
 	n.notifyApplyLocked()
 	return InstallSnapshotResponse{
 		Term:          n.currentTerm,
@@ -598,7 +632,7 @@ func (n *Node) applyLoop() {
 
 func (n *Node) startElection() {
 	n.mu.Lock()
-	if n.role == Leader {
+	if n.role == Leader || n.storageFatal != nil {
 		n.mu.Unlock()
 		return
 	}
@@ -611,6 +645,7 @@ func (n *Node) startElection() {
 	term := n.currentTerm
 	n.votedFor = n.id
 	n.leaderID = ""
+	n.leaderNoopIndex = 0
 	n.resetElectionLocked()
 	lastIndex := n.lastIndexLocked()
 	lastTerm := n.lastTermLocked()
@@ -635,7 +670,7 @@ func (n *Node) startElection() {
 		resp RequestVoteResponse
 		err  error
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), n.timeoutMax)
+	ctx, cancel := context.WithTimeout(context.Background(), n.timeoutMin)
 	defer cancel()
 	results := make(chan voteResult, len(n.peerAddrs))
 	req := RequestVoteRequest{
@@ -703,17 +738,17 @@ func (n *Node) becomeLeader(term uint64) {
 		Command: storage.Command{Op: storage.OpNoop},
 	}
 	if err := n.store.AppendEntries([]storage.LogEntry{noop}); err != nil {
-		// Without the no-op, prev-term entries stay uncommitted until a future
-		// successful Propose. We remain leader but record the error.
-		n.lastErr = err
-	} else {
-		n.log = append(n.log, noop)
-		n.matchIndex[n.id] = noop.Index
-		n.nextIndex[n.id] = noop.Index + 1
-		// Single-node clusters commit the no-op immediately; multi-node
-		// clusters defer to peer acks.
-		n.advanceCommitLocked()
+		n.failStorageLocked(err)
+		n.mu.Unlock()
+		return
 	}
+	n.log = append(n.log, noop)
+	n.leaderNoopIndex = noop.Index
+	n.matchIndex[n.id] = noop.Index
+	n.nextIndex[n.id] = noop.Index + 1
+	// Single-node clusters commit the no-op immediately; multi-node
+	// clusters defer to peer acks.
+	n.advanceCommitLocked()
 	n.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), n.timeoutMin)
@@ -736,18 +771,21 @@ func (n *Node) becomeFollowerLocked(term uint64, leaderID string) error {
 	prevVotedFor := n.votedFor
 	prevRole := n.role
 	prevLeader := n.leaderID
+	prevLeaderNoop := n.leaderNoopIndex
 	if term > n.currentTerm {
 		n.currentTerm = term
 		n.votedFor = ""
 	}
 	n.role = Follower
 	n.leaderID = leaderID
+	n.leaderNoopIndex = 0
 	n.resetElectionLocked()
 	if err := n.persistHardStateLocked(); err != nil {
 		n.currentTerm = prevTerm
 		n.votedFor = prevVotedFor
 		n.role = prevRole
 		n.leaderID = prevLeader
+		n.leaderNoopIndex = prevLeaderNoop
 		return err
 	}
 	if prevRole == Leader {
@@ -759,6 +797,19 @@ func (n *Node) becomeFollowerLocked(term uint64, leaderID string) error {
 		n.failUncommittedWaitersLocked()
 	}
 	return nil
+}
+
+func (n *Node) failStorageLocked(err error) {
+	if err == nil {
+		return
+	}
+	n.lastErr = err
+	n.storageFatal = err
+	n.role = Follower
+	n.leaderID = ""
+	n.leaderNoopIndex = 0
+	n.resetElectionLocked()
+	n.failUncommittedWaitersLocked()
 }
 
 // failUncommittedWaitersLocked delivers a NotLeader outcome to every waiter
@@ -1082,55 +1133,93 @@ func (n *Node) advanceCommitLocked() {
 
 func (n *Node) applyReady() {
 	for {
+		var snapshotToPersist *storage.Snapshot
 		n.mu.Lock()
 		if n.lastApplied >= n.commitIndex {
 			n.mu.Unlock()
 			return
 		}
 		nextIndex := n.lastApplied + 1
+		if nextIndex <= n.snapshot.LastIncludedIndex {
+			n.lastApplied = n.snapshot.LastIncludedIndex
+			n.mu.Unlock()
+			continue
+		}
 		entry, ok := n.entryAtLocked(nextIndex)
 		if !ok {
-			if nextIndex <= n.snapshot.LastIncludedIndex {
-				n.lastApplied = nextIndex
-			}
 			n.mu.Unlock()
 			return
 		}
-		n.mu.Unlock()
-
 		result := n.sm.Apply(entry.Command)
-
-		n.mu.Lock()
-		if n.lastApplied < entry.Index {
-			n.lastApplied = entry.Index
-			n.finishWaitersLocked(entry.Index, result)
-			if n.snapshotEvery > 0 && len(n.log) > n.snapshotEvery && n.lastApplied > n.snapshot.LastIncludedIndex {
-				n.createSnapshotLocked(n.lastApplied)
+		n.lastApplied = entry.Index
+		n.applyCond.Broadcast()
+		n.finishWaitersLocked(entry.Index, result)
+		if n.snapshotEvery > 0 && len(n.log) > n.snapshotEvery && n.lastApplied > n.snapshot.LastIncludedIndex {
+			if snapshot, ok := n.snapshotAtLocked(n.lastApplied); ok {
+				snapshotToPersist = &snapshot
 			}
 		}
 		n.mu.Unlock()
+		if snapshotToPersist != nil {
+			n.persistSnapshot(*snapshotToPersist)
+		}
 	}
 }
 
-func (n *Node) createSnapshotLocked(index uint64) {
+func (n *Node) snapshotAtLocked(index uint64) (storage.Snapshot, bool) {
 	term, ok := n.termAtLocked(index)
 	if !ok {
-		return
+		return storage.Snapshot{}, false
 	}
-	snapshot := storage.Snapshot{
+	return storage.Snapshot{
 		LastIncludedIndex: index,
 		LastIncludedTerm:  term,
 		Data:              cloneMap(n.sm.Snapshot()),
+	}, true
+}
+
+func (n *Node) logAfterSnapshotLocked(snapshot storage.Snapshot) []storage.LogEntry {
+	term, ok := n.termAtLocked(snapshot.LastIncludedIndex)
+	if !ok || term != snapshot.LastIncludedTerm {
+		return nil
 	}
 	newLog := make([]storage.LogEntry, 0, len(n.log))
 	for _, entry := range n.log {
-		if entry.Index > index {
+		if entry.Index > snapshot.LastIncludedIndex {
 			newLog = append(newLog, entry)
 		}
 	}
-	if err := n.store.SaveSnapshot(snapshot); err != nil {
-		n.lastErr = err
+	return newLog
+}
+
+func (n *Node) persistSnapshot(snapshot storage.Snapshot) {
+	n.snapshotPersistMu.Lock()
+	defer n.snapshotPersistMu.Unlock()
+
+	n.mu.Lock()
+	if snapshot.LastIncludedIndex <= n.snapshot.LastIncludedIndex || snapshot.LastIncludedIndex > n.lastApplied {
+		n.mu.Unlock()
 		return
+	}
+	n.mu.Unlock()
+
+	if err := n.store.SaveSnapshot(snapshot); err != nil {
+		n.mu.Lock()
+		n.lastErr = err
+		n.mu.Unlock()
+		return
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if snapshot.LastIncludedIndex <= n.snapshot.LastIncludedIndex || snapshot.LastIncludedIndex > n.lastApplied {
+		return
+	}
+	newLog := make([]storage.LogEntry, 0, len(n.log))
+	for _, entry := range n.log {
+		if entry.Index > snapshot.LastIncludedIndex {
+			newLog = append(newLog, entry)
+		}
 	}
 	if err := n.store.ReplaceEntries(newLog); err != nil {
 		n.lastErr = err
@@ -1193,16 +1282,6 @@ func (n *Node) truncateFromLocked(index uint64) {
 	if keep < uint64(len(n.log)) {
 		n.log = append([]storage.LogEntry(nil), n.log[:keep]...)
 	}
-}
-
-func (n *Node) dropLogThroughLocked(index uint64) {
-	kept := n.log[:0]
-	for _, entry := range n.log {
-		if entry.Index > index {
-			kept = append(kept, entry)
-		}
-	}
-	n.log = append([]storage.LogEntry(nil), kept...)
 }
 
 func (n *Node) entriesFromLocked(index uint64) []storage.LogEntry {
@@ -1269,6 +1348,7 @@ func (n *Node) notifyApplyLocked() {
 	case n.applyCh <- struct{}{}:
 	default:
 	}
+	n.applyCond.Broadcast()
 }
 
 func (n *Node) finishWaitersLocked(index uint64, result storage.ApplyResult) {
@@ -1296,19 +1376,22 @@ func (n *Node) removeWaiter(index uint64, target chan applyOutcome) {
 }
 
 func (n *Node) waitUntilApplied(ctx context.Context, index uint64) error {
-	for {
+	stop := context.AfterFunc(ctx, func() {
 		n.mu.Lock()
-		if n.lastApplied >= index {
-			n.mu.Unlock()
-			return nil
-		}
+		n.applyCond.Broadcast()
 		n.mu.Unlock()
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(10 * time.Millisecond):
+	})
+	defer stop()
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for n.lastApplied < index {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
+		n.applyCond.Wait()
 	}
+	return nil
 }
 
 func (n *Node) quorum() int {

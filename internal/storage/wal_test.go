@@ -121,3 +121,58 @@ func TestWALRejectsMidFileCorruption(t *testing.T) {
 		t.Fatal("expected Load to surface a mid-file corruption error")
 	}
 }
+
+func TestWALRecoversFromCorruptTrailingLine(t *testing.T) {
+	dir := t.TempDir()
+	walPath := filepath.Join(dir, "wal.jsonl")
+	data := "" +
+		`{"index":1,"term":1,"command":{"op":"put","key":"a","value":"1"}}` + "\n" +
+		`{"index":2,"term":1,"command":{"op":"put","key":"b","value":"2"}}` + "\n" +
+		`{"index":3,"term":1,"command"` + "\n"
+	if err := os.WriteFile(walPath, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, entries, _, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load should truncate a corrupt trailing WAL record: %v", err)
+	}
+	if len(entries) != 2 || entries[1].Index != 2 {
+		t.Fatalf("expected only complete entries, got %+v", entries)
+	}
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, entries, _, err = reopened.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected truncation to persist, got %d entries", len(entries))
+	}
+}
+
+func TestWALRejectsDuplicateIndex(t *testing.T) {
+	dir := t.TempDir()
+	walPath := filepath.Join(dir, "wal.jsonl")
+	data := "" +
+		`{"index":1,"term":1,"command":{"op":"put","key":"a","value":"1"}}` + "\n" +
+		`{"index":1,"term":1,"command":{"op":"put","key":"b","value":"2"}}` + "\n"
+	if err := os.WriteFile(walPath, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := store.Load(); err == nil {
+		t.Fatal("expected Load to reject duplicate WAL indexes")
+	}
+}

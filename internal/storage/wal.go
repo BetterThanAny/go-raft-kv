@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 )
 
 type Store struct {
@@ -148,7 +149,22 @@ func readWAL(path string) ([]LogEntry, error) {
 		}
 		var entry LogEntry
 		if err := json.Unmarshal(line, &entry); err != nil {
+			if len(bytes.TrimSpace(data[offset:])) == 0 {
+				if err := truncateFile(path, int64(offset-nl-1)); err != nil {
+					return nil, fmt.Errorf("truncate corrupt WAL tail: %w", err)
+				}
+				break
+			}
 			return nil, fmt.Errorf("decode WAL entry at byte offset %d: %w", offset-nl-1, err)
+		}
+		if entry.Index == 0 {
+			return nil, fmt.Errorf("decode WAL entry at byte offset %d: zero log index", offset-nl-1)
+		}
+		if len(entries) > 0 {
+			prev := entries[len(entries)-1]
+			if entry.Index != prev.Index+1 {
+				return nil, fmt.Errorf("decode WAL entry at byte offset %d: non-contiguous log index %d after %d", offset-nl-1, entry.Index, prev.Index)
+			}
 		}
 		entries = append(entries, entry)
 	}
@@ -247,14 +263,8 @@ func syncDir(dir string) error {
 		_ = f.Close()
 		// Some platforms (e.g. macOS on certain filesystems) may reject fsync on a directory.
 		// Treat EINVAL/ENOTSUP as success since we did our best.
-		var pathErr *os.PathError
-		if errors.As(err, &pathErr) {
-			if errno, ok := pathErr.Err.(interface{ Error() string }); ok {
-				msg := errno.Error()
-				if msg == "invalid argument" || msg == "operation not supported" {
-					return nil
-				}
-			}
+		if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTSUP) {
+			return nil
 		}
 		return err
 	}
