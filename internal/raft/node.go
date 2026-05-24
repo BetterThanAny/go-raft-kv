@@ -37,6 +37,7 @@ type snapshotProgress struct {
 // Configurable per Node via Config.SnapshotChunkBytes; falls back to this
 // default if unset.
 const defaultSnapshotChunkBytes = 1 << 20 // 1 MiB
+const maxReplicationAttempts = 128
 
 type Node struct {
 	id          string
@@ -59,6 +60,7 @@ type Node struct {
 	leaderNoopIndex    uint64
 	nextIndex          map[string]uint64
 	matchIndex         map[string]uint64
+	replicating        map[string]bool
 	electionDue        time.Time
 	heartbeatEvery     time.Duration
 	readTimeout        time.Duration
@@ -73,6 +75,7 @@ type Node struct {
 	storageFatal       error
 
 	proposeMu         sync.Mutex
+	applyMu           sync.Mutex
 	snapshotPersistMu sync.Mutex
 	applyCond         *sync.Cond
 	applyCh           chan struct{}
@@ -151,6 +154,7 @@ func NewNode(cfg Config, store Store, sm StateMachine, transport Transport) (*No
 		lastApplied:        lastApplied,
 		nextIndex:          make(map[string]uint64),
 		matchIndex:         make(map[string]uint64),
+		replicating:        make(map[string]bool),
 		heartbeatEvery:     cfg.HeartbeatInterval,
 		readTimeout:        cfg.ReadTimeout,
 		timeoutMin:         cfg.ElectionTimeoutMin,
@@ -464,9 +468,22 @@ func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRespon
 
 	// Snapshot in-memory log before mutating so we can roll back if WAL write fails.
 	prevLog := n.log
-	changed := n.mergeEntriesLocked(req.Entries)
-	if changed {
-		if err := n.store.ReplaceEntries(n.log); err != nil {
+	merge := n.mergeEntriesLocked(req.Entries)
+	if merge.conflictIndex > 0 {
+		return AppendEntriesResponse{
+			Term:          n.currentTerm,
+			ConflictIndex: merge.conflictIndex,
+			LastLogIndex:  n.lastIndexLocked(),
+		}
+	}
+	if merge.changed {
+		var err error
+		if merge.replaced {
+			err = n.store.ReplaceEntries(n.log)
+		} else {
+			err = n.store.AppendEntries(merge.appended)
+		}
+		if err != nil {
 			n.log = prevLog
 			n.failStorageLocked(err)
 			return AppendEntriesResponse{Term: n.currentTerm, LastLogIndex: n.lastIndexLocked()}
@@ -493,17 +510,22 @@ func (n *Node) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshot
 	defer n.snapshotPersistMu.Unlock()
 
 	n.mu.Lock()
-	defer n.mu.Unlock()
-
 	if n.storageFatal != nil {
-		return InstallSnapshotResponse{Term: n.currentTerm}
+		term := n.currentTerm
+		n.mu.Unlock()
+		return InstallSnapshotResponse{Term: term}
 	}
 	if req.Term < n.currentTerm {
-		return InstallSnapshotResponse{Term: n.currentTerm}
+		term := n.currentTerm
+		n.mu.Unlock()
+		return InstallSnapshotResponse{Term: term}
 	}
 	if req.Term > n.currentTerm || n.role != Follower {
 		if err := n.becomeFollowerLocked(req.Term, req.LeaderID); err != nil {
-			return InstallSnapshotResponse{Term: n.currentTerm}
+			n.pendingSnapshot = nil
+			term := n.currentTerm
+			n.mu.Unlock()
+			return InstallSnapshotResponse{Term: term}
 		}
 	}
 	n.leaderID = req.LeaderID
@@ -513,7 +535,9 @@ func (n *Node) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshot
 		// Already applied at or beyond this snapshot. Installing it would roll the
 		// state machine back, so ack it as stale and let the leader advance.
 		n.pendingSnapshot = nil
-		return InstallSnapshotResponse{Term: n.currentTerm, Success: true}
+		term := n.currentTerm
+		n.mu.Unlock()
+		return InstallSnapshotResponse{Term: term, Success: true}
 	}
 
 	progress := n.pendingSnapshot
@@ -525,7 +549,9 @@ func (n *Node) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshot
 		// snapshot (newer leader, newer snapshot). Start over only if the
 		// chunk itself is at offset 0; otherwise tell the leader we need 0.
 		if req.Offset != 0 {
-			return InstallSnapshotResponse{Term: n.currentTerm, BytesReceived: 0}
+			term := n.currentTerm
+			n.mu.Unlock()
+			return InstallSnapshotResponse{Term: term, BytesReceived: 0}
 		}
 		progress = &snapshotProgress{
 			leaderID:          req.LeaderID,
@@ -538,64 +564,117 @@ func (n *Node) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshot
 	if req.Offset != uint64(len(progress.buffer)) {
 		// Out-of-order chunk — likely from a retry. Tell the leader the actual
 		// progress so it can resume from there.
+		term := n.currentTerm
+		bytesReceived := uint64(len(progress.buffer))
+		n.mu.Unlock()
 		return InstallSnapshotResponse{
-			Term:          n.currentTerm,
-			BytesReceived: uint64(len(progress.buffer)),
+			Term:          term,
+			BytesReceived: bytesReceived,
 		}
 	}
 	progress.buffer = append(progress.buffer, req.Data...)
 
 	if !req.Done {
+		term := n.currentTerm
+		bytesReceived := uint64(len(progress.buffer))
+		n.mu.Unlock()
 		return InstallSnapshotResponse{
-			Term:          n.currentTerm,
+			Term:          term,
 			Success:       true,
-			BytesReceived: uint64(len(progress.buffer)),
+			BytesReceived: bytesReceived,
 		}
 	}
+	body := append([]byte(nil), progress.buffer...)
+	n.mu.Unlock()
 
 	// Final chunk: decode, persist disk-first, then mutate memory, then
 	// restore the state machine.
 	var data map[string]string
-	if len(progress.buffer) > 0 {
-		if err := json.Unmarshal(progress.buffer, &data); err != nil {
+	if len(body) > 0 {
+		if err := json.Unmarshal(body, &data); err != nil {
+			n.mu.Lock()
+			n.pendingSnapshot = nil
+			term := n.currentTerm
+			n.mu.Unlock()
+			return InstallSnapshotResponse{Term: term}
+		}
+	}
+
+	n.applyMu.Lock()
+	defer n.applyMu.Unlock()
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.storageFatal != nil {
+		n.pendingSnapshot = nil
+		return InstallSnapshotResponse{Term: n.currentTerm}
+	}
+	if req.Term < n.currentTerm {
+		n.pendingSnapshot = nil
+		return InstallSnapshotResponse{Term: n.currentTerm}
+	}
+	if req.Term > n.currentTerm || n.role != Follower {
+		if err := n.becomeFollowerLocked(req.Term, req.LeaderID); err != nil {
 			n.pendingSnapshot = nil
 			return InstallSnapshotResponse{Term: n.currentTerm}
 		}
 	}
+	n.leaderID = req.LeaderID
+	n.resetElectionLocked()
+	if req.LastIncludedIndex <= n.lastApplied {
+		n.pendingSnapshot = nil
+		return InstallSnapshotResponse{Term: n.currentTerm, Success: true}
+	}
+	progress = n.pendingSnapshot
+	if progress == nil ||
+		progress.leaderID != req.LeaderID ||
+		progress.lastIncludedIndex != req.LastIncludedIndex ||
+		progress.lastIncludedTerm != req.LastIncludedTerm ||
+		uint64(len(progress.buffer)) != uint64(len(body)) {
+		return InstallSnapshotResponse{Term: n.currentTerm, BytesReceived: 0}
+	}
+
 	newSnap := storage.Snapshot{
 		LastIncludedIndex: req.LastIncludedIndex,
 		LastIncludedTerm:  req.LastIncludedTerm,
 		Data:              data,
 	}
 	newLog := n.logAfterSnapshotLocked(newSnap)
+	newCommit := n.commitIndex
+	if newCommit < newSnap.LastIncludedIndex {
+		newCommit = newSnap.LastIncludedIndex
+	}
 
 	if err := n.store.SaveSnapshot(newSnap); err != nil {
+		n.pendingSnapshot = nil
+		n.failStorageLocked(err)
 		return InstallSnapshotResponse{Term: n.currentTerm}
 	}
 	if err := n.store.ReplaceEntries(newLog); err != nil {
+		n.pendingSnapshot = nil
+		n.failStorageLocked(err)
+		return InstallSnapshotResponse{Term: n.currentTerm}
+	}
+	if err := n.saveHardStateLocked(newCommit); err != nil {
+		n.pendingSnapshot = nil
+		n.failStorageLocked(err)
 		return InstallSnapshotResponse{Term: n.currentTerm}
 	}
 
 	n.snapshot = newSnap
 	n.log = newLog
-	if n.commitIndex < newSnap.LastIncludedIndex {
-		n.commitIndex = newSnap.LastIncludedIndex
-	}
+	n.commitIndex = newCommit
 	if n.lastApplied < newSnap.LastIncludedIndex {
 		n.lastApplied = newSnap.LastIncludedIndex
-		n.applyCond.Broadcast()
 	}
 	n.sm.Restore(newSnap.Data)
 	n.pendingSnapshot = nil
-	if err := n.persistHardStateLocked(); err != nil {
-		n.failStorageLocked(err)
-		return InstallSnapshotResponse{Term: n.currentTerm}
-	}
+	n.applyCond.Broadcast()
 	n.notifyApplyLocked()
 	return InstallSnapshotResponse{
 		Term:          n.currentTerm,
 		Success:       true,
-		BytesReceived: uint64(len(progress.buffer)),
+		BytesReceived: uint64(len(body)),
 	}
 }
 
@@ -739,6 +818,7 @@ func (n *Node) becomeLeader(term uint64) {
 	last := n.lastIndexLocked()
 	n.nextIndex = make(map[string]uint64)
 	n.matchIndex = make(map[string]uint64)
+	n.replicating = make(map[string]bool)
 	n.matchIndex[n.id] = last
 	n.nextIndex[n.id] = last + 1
 	for peerID := range n.peerAddrs {
@@ -828,6 +908,7 @@ func (n *Node) failStorageLocked(err error) {
 	n.leaderNoopIndex = 0
 	n.resetElectionLocked()
 	n.failUncommittedWaitersLocked()
+	n.applyCond.Broadcast()
 }
 
 // failUncommittedWaitersLocked delivers a NotLeader outcome to every waiter
@@ -856,6 +937,10 @@ func (n *Node) replicateAllOnce(ctx context.Context) error {
 	}
 	peers := make([]string, 0, len(n.peerAddrs))
 	for peerID := range n.peerAddrs {
+		if n.replicating[peerID] {
+			continue
+		}
+		n.replicating[peerID] = true
 		peers = append(peers, peerID)
 	}
 	n.mu.Unlock()
@@ -864,12 +949,21 @@ func (n *Node) replicateAllOnce(ctx context.Context) error {
 	for _, peerID := range peers {
 		wg.Add(1)
 		go func(peerID string) {
-			defer wg.Done()
+			defer func() {
+				n.finishPeerReplication(peerID)
+				wg.Done()
+			}()
 			n.replicateToPeer(ctx, peerID)
 		}(peerID)
 	}
 	wg.Wait()
 	return nil
+}
+
+func (n *Node) finishPeerReplication(peerID string) {
+	n.mu.Lock()
+	delete(n.replicating, peerID)
+	n.mu.Unlock()
 }
 
 // replicateToPeer drives one peer's replication state forward. It returns true
@@ -878,7 +972,7 @@ func (n *Node) replicateAllOnce(ctx context.Context) error {
 // This is the per-call "did the peer just acknowledge our leadership" signal
 // ensureQuorum uses to confirm a fresh read barrier.
 func (n *Node) replicateToPeer(ctx context.Context, peerID string) bool {
-	for attempts := 0; attempts < 128; attempts++ {
+	for attempts := 0; attempts < maxReplicationAttempts; attempts++ {
 		select {
 		case <-ctx.Done():
 			return false
@@ -953,8 +1047,12 @@ func (n *Node) replicateToPeer(ctx context.Context, peerID string) bool {
 		}
 		if resp.Success {
 			match := prevIndex + uint64(len(entries))
-			n.matchIndex[peerID] = match
-			n.nextIndex[peerID] = match + 1
+			if n.matchIndex[peerID] < match {
+				n.matchIndex[peerID] = match
+			}
+			if n.nextIndex[peerID] < match+1 {
+				n.nextIndex[peerID] = match + 1
+			}
 			n.advanceCommitLocked()
 			n.mu.Unlock()
 			return true
@@ -1152,23 +1250,36 @@ func (n *Node) advanceCommitLocked() {
 func (n *Node) applyReady() {
 	for {
 		var snapshotToPersist *storage.Snapshot
+		n.applyMu.Lock()
 		n.mu.Lock()
 		if n.lastApplied >= n.commitIndex {
 			n.mu.Unlock()
+			n.applyMu.Unlock()
 			return
 		}
 		nextIndex := n.lastApplied + 1
 		if nextIndex <= n.snapshot.LastIncludedIndex {
 			n.lastApplied = n.snapshot.LastIncludedIndex
 			n.mu.Unlock()
+			n.applyMu.Unlock()
 			continue
 		}
 		entry, ok := n.entryAtLocked(nextIndex)
 		if !ok {
 			n.mu.Unlock()
+			n.applyMu.Unlock()
 			return
 		}
+		n.mu.Unlock()
+
 		result := n.sm.Apply(entry.Command)
+
+		n.mu.Lock()
+		if entry.Index != n.lastApplied+1 || entry.Index > n.commitIndex {
+			n.mu.Unlock()
+			n.applyMu.Unlock()
+			continue
+		}
 		n.lastApplied = entry.Index
 		n.applyCond.Broadcast()
 		n.finishWaitersLocked(entry.Index, result)
@@ -1178,6 +1289,7 @@ func (n *Node) applyReady() {
 			}
 		}
 		n.mu.Unlock()
+		n.applyMu.Unlock()
 		if snapshotToPersist != nil {
 			n.persistSnapshot(*snapshotToPersist)
 		}
@@ -1247,8 +1359,19 @@ func (n *Node) persistSnapshot(snapshot storage.Snapshot) {
 	n.log = newLog
 }
 
-func (n *Node) mergeEntriesLocked(entries []storage.LogEntry) bool {
-	changed := false
+type mergeEntriesResult struct {
+	changed       bool
+	replaced      bool
+	appended      []storage.LogEntry
+	conflictIndex uint64
+}
+
+func (n *Node) mergeEntriesLocked(entries []storage.LogEntry) mergeEntriesResult {
+	if conflictIndex := n.validateEntriesLocked(entries); conflictIndex > 0 {
+		return mergeEntriesResult{conflictIndex: conflictIndex}
+	}
+
+	var result mergeEntriesResult
 	for i, entry := range entries {
 		if entry.Index <= n.snapshot.LastIncludedIndex {
 			continue
@@ -1260,14 +1383,30 @@ func (n *Node) mergeEntriesLocked(entries []storage.LogEntry) bool {
 			}
 			n.truncateFromLocked(entry.Index)
 			n.log = append(n.log, entries[i:]...)
-			return true
+			return mergeEntriesResult{changed: true, replaced: true}
 		}
-		if entry.Index == n.lastIndexLocked()+1 {
-			n.log = append(n.log, entry)
-			changed = true
+		if entry.Index != n.lastIndexLocked()+1 {
+			return mergeEntriesResult{conflictIndex: n.lastIndexLocked() + 1}
 		}
+		n.log = append(n.log, entry)
+		result.changed = true
+		result.appended = append(result.appended, entry)
 	}
-	return changed
+	return result
+}
+
+func (n *Node) validateEntriesLocked(entries []storage.LogEntry) uint64 {
+	var prev uint64
+	for _, entry := range entries {
+		if entry.Index <= n.snapshot.LastIncludedIndex {
+			continue
+		}
+		if prev != 0 && entry.Index != prev+1 {
+			return prev + 1
+		}
+		prev = entry.Index
+	}
+	return 0
 }
 
 func (n *Node) conflictIndexLocked(index uint64) uint64 {
@@ -1350,10 +1489,14 @@ func (n *Node) lastTermLocked() uint64 {
 }
 
 func (n *Node) persistHardStateLocked() error {
+	return n.saveHardStateLocked(n.commitIndex)
+}
+
+func (n *Node) saveHardStateLocked(commitIndex uint64) error {
 	err := n.store.SaveHardState(storage.HardState{
 		CurrentTerm: n.currentTerm,
 		VotedFor:    n.votedFor,
-		CommitIndex: n.commitIndex,
+		CommitIndex: commitIndex,
 	})
 	if err != nil {
 		n.lastErr = err
@@ -1404,6 +1547,9 @@ func (n *Node) waitUntilApplied(ctx context.Context, index uint64) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for n.lastApplied < index {
+		if n.storageFatal != nil {
+			return n.storageFatal
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}

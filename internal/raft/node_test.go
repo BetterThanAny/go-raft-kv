@@ -23,6 +23,10 @@ type mockStore struct {
 	failAppend    bool
 	failReplace   bool
 	failSnapshot  bool
+
+	appendCalls   int
+	replaceCalls  int
+	snapshotCalls int
 }
 
 func (s *mockStore) Load() (storage.HardState, []storage.LogEntry, storage.Snapshot, error) {
@@ -47,6 +51,7 @@ func (s *mockStore) AppendEntries(entries []storage.LogEntry) error {
 	if s.failAppend {
 		return errors.New("injected append failure")
 	}
+	s.appendCalls++
 	s.entries = append(s.entries, entries...)
 	return nil
 }
@@ -57,6 +62,7 @@ func (s *mockStore) ReplaceEntries(entries []storage.LogEntry) error {
 	if s.failReplace {
 		return errors.New("injected replace failure")
 	}
+	s.replaceCalls++
 	s.entries = append([]storage.LogEntry(nil), entries...)
 	return nil
 }
@@ -67,6 +73,7 @@ func (s *mockStore) SaveSnapshot(snap storage.Snapshot) error {
 	if s.failSnapshot {
 		return errors.New("injected snapshot failure")
 	}
+	s.snapshotCalls++
 	s.snapshot = snap
 	return nil
 }
@@ -93,6 +100,12 @@ func (s *mockStore) setFailSnapshot(v bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failSnapshot = v
+}
+
+func (s *mockStore) callCounts() (int, int, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appendCalls, s.replaceCalls, s.snapshotCalls
 }
 
 type stubTransport struct{}
@@ -132,6 +145,80 @@ func (t *appendAckTransport) AppendEntries(ctx context.Context, _ string, req Ap
 
 func (t *appendAckTransport) InstallSnapshot(context.Context, string, InstallSnapshotRequest) (InstallSnapshotResponse, error) {
 	return InstallSnapshotResponse{}, errors.New("no snapshots")
+}
+
+type delayedAppendTransport struct {
+	firstSeen    chan AppendEntriesRequest
+	secondSeen   chan AppendEntriesRequest
+	releaseFirst chan struct{}
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (t *delayedAppendTransport) RequestVote(context.Context, string, RequestVoteRequest) (RequestVoteResponse, error) {
+	return RequestVoteResponse{}, errors.New("no votes")
+}
+
+func (t *delayedAppendTransport) AppendEntries(ctx context.Context, _ string, req AppendEntriesRequest) (AppendEntriesResponse, error) {
+	t.mu.Lock()
+	t.calls++
+	call := t.calls
+	t.mu.Unlock()
+
+	switch call {
+	case 1:
+		t.firstSeen <- req
+		select {
+		case <-t.releaseFirst:
+		case <-ctx.Done():
+			return AppendEntriesResponse{}, ctx.Err()
+		}
+	case 2:
+		t.secondSeen <- req
+	default:
+		return AppendEntriesResponse{}, errors.New("unexpected append call")
+	}
+	return AppendEntriesResponse{Term: req.Term, Success: true, LastLogIndex: req.PrevLogIndex + uint64(len(req.Entries))}, nil
+}
+
+func (t *delayedAppendTransport) InstallSnapshot(context.Context, string, InstallSnapshotRequest) (InstallSnapshotResponse, error) {
+	return InstallSnapshotResponse{}, errors.New("no snapshots")
+}
+
+type blockingAppendTransport struct {
+	started chan string
+	release chan struct{}
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (t *blockingAppendTransport) RequestVote(context.Context, string, RequestVoteRequest) (RequestVoteResponse, error) {
+	return RequestVoteResponse{}, errors.New("no votes")
+}
+
+func (t *blockingAppendTransport) AppendEntries(ctx context.Context, peerID string, req AppendEntriesRequest) (AppendEntriesResponse, error) {
+	t.mu.Lock()
+	t.calls++
+	t.mu.Unlock()
+	t.started <- peerID
+	select {
+	case <-t.release:
+	case <-ctx.Done():
+		return AppendEntriesResponse{}, ctx.Err()
+	}
+	return AppendEntriesResponse{Term: req.Term, Success: true, LastLogIndex: req.PrevLogIndex + uint64(len(req.Entries))}, nil
+}
+
+func (t *blockingAppendTransport) InstallSnapshot(context.Context, string, InstallSnapshotRequest) (InstallSnapshotResponse, error) {
+	return InstallSnapshotResponse{}, errors.New("no snapshots")
+}
+
+func (t *blockingAppendTransport) callCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.calls
 }
 
 type stubStateMachine struct {
@@ -286,10 +373,10 @@ func TestHandleRequestVoteRejectsWhenHardStateFails(t *testing.T) {
 	}
 }
 
-func TestHandleAppendEntriesRejectsWhenReplaceFails(t *testing.T) {
+func TestHandleAppendEntriesRejectsWhenAppendFails(t *testing.T) {
 	store := &mockStore{}
 	node := newTestNode(t, store)
-	store.setFailReplace(true)
+	store.setFailAppend(true)
 
 	resp := node.HandleAppendEntries(AppendEntriesRequest{
 		Term:         1,
@@ -302,7 +389,7 @@ func TestHandleAppendEntriesRejectsWhenReplaceFails(t *testing.T) {
 	})
 
 	if resp.Success {
-		t.Fatal("Success must be false when WAL replace fails — otherwise leader thinks follower persisted what it didn't")
+		t.Fatal("Success must be false when WAL append fails — otherwise leader thinks follower persisted what it didn't")
 	}
 
 	node.mu.Lock()
@@ -310,6 +397,98 @@ func TestHandleAppendEntriesRejectsWhenReplaceFails(t *testing.T) {
 	node.mu.Unlock()
 	if logLen != 0 {
 		t.Fatalf("in-memory log should be empty after rollback, got %d entries", logLen)
+	}
+}
+
+func TestHandleAppendEntriesUsesAppendForContiguousSuffix(t *testing.T) {
+	store := &mockStore{
+		entries: []storage.LogEntry{
+			{Index: 1, Term: 1, Command: storage.Command{Op: storage.OpPut, Key: "a", Value: "1"}},
+		},
+	}
+	node := newTestNode(t, store)
+
+	resp := node.HandleAppendEntries(AppendEntriesRequest{
+		Term:         1,
+		LeaderID:     "n2",
+		PrevLogIndex: 1,
+		PrevLogTerm:  1,
+		Entries: []storage.LogEntry{
+			{Index: 2, Term: 1, Command: storage.Command{Op: storage.OpPut, Key: "b", Value: "2"}},
+			{Index: 3, Term: 1, Command: storage.Command{Op: storage.OpPut, Key: "c", Value: "3"}},
+		},
+	})
+	if !resp.Success {
+		t.Fatalf("append-only suffix should succeed: %+v", resp)
+	}
+	appendCalls, replaceCalls, _ := store.callCounts()
+	if appendCalls != 1 || replaceCalls != 0 {
+		t.Fatalf("expected one append and no replace, got append=%d replace=%d", appendCalls, replaceCalls)
+	}
+}
+
+func TestHandleAppendEntriesRejectsWhenReplaceFails(t *testing.T) {
+	store := &mockStore{
+		entries: []storage.LogEntry{
+			{Index: 1, Term: 1, Command: storage.Command{Op: storage.OpPut, Key: "a", Value: "old"}},
+		},
+	}
+	node := newTestNode(t, store)
+	store.setFailReplace(true)
+
+	resp := node.HandleAppendEntries(AppendEntriesRequest{
+		Term:         1,
+		LeaderID:     "n2",
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+		Entries: []storage.LogEntry{
+			{Index: 1, Term: 2, Command: storage.Command{Op: storage.OpPut, Key: "a", Value: "new"}},
+		},
+	})
+
+	if resp.Success {
+		t.Fatal("Success must be false when WAL replace fails — otherwise leader thinks follower persisted a conflicting suffix")
+	}
+
+	node.mu.Lock()
+	logCopy := append([]storage.LogEntry(nil), node.log...)
+	node.mu.Unlock()
+	if len(logCopy) != 1 || logCopy[0].Term != 1 || logCopy[0].Command.Value != "old" {
+		t.Fatalf("in-memory log should roll back to the original entry, got %+v", logCopy)
+	}
+}
+
+func TestHandleAppendEntriesRejectsNonContiguousEntries(t *testing.T) {
+	store := &mockStore{}
+	node := newTestNode(t, store)
+
+	resp := node.HandleAppendEntries(AppendEntriesRequest{
+		Term:         1,
+		LeaderID:     "n2",
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+		Entries: []storage.LogEntry{
+			{Index: 1, Term: 1, Command: storage.Command{Op: storage.OpPut, Key: "a", Value: "1"}},
+			{Index: 3, Term: 1, Command: storage.Command{Op: storage.OpPut, Key: "c", Value: "3"}},
+		},
+	})
+
+	if resp.Success {
+		t.Fatal("AppendEntries with a gap must be rejected")
+	}
+	if resp.ConflictIndex != 2 {
+		t.Fatalf("expected conflict index 2 for missing entry, got %d", resp.ConflictIndex)
+	}
+
+	node.mu.Lock()
+	logLen := len(node.log)
+	node.mu.Unlock()
+	if logLen != 0 {
+		t.Fatalf("non-contiguous request must not partially mutate the log, got %d entries", logLen)
+	}
+	appendCalls, replaceCalls, _ := store.callCounts()
+	if appendCalls != 0 || replaceCalls != 0 {
+		t.Fatalf("non-contiguous request must not touch storage, got append=%d replace=%d", appendCalls, replaceCalls)
 	}
 }
 
@@ -377,13 +556,60 @@ func TestHandleInstallSnapshotRejectsWhenSaveFails(t *testing.T) {
 
 	node.mu.Lock()
 	snapIdx := node.snapshot.LastIncludedIndex
+	pending := node.pendingSnapshot
+	fatalErr := node.storageFatal
 	node.mu.Unlock()
 	if snapIdx != 0 {
 		t.Fatalf("in-memory snapshot must not advance when persist fails, got LastIncludedIndex=%d", snapIdx)
 	}
+	if pending != nil {
+		t.Fatal("pending snapshot must be cleared after SaveSnapshot failure")
+	}
+	if fatalErr == nil {
+		t.Fatal("node must record a fatal storage error after SaveSnapshot failure")
+	}
 }
 
-func TestHandleInstallSnapshotKeepsMemoryAdvancedWhenHardStateFails(t *testing.T) {
+func TestHandleInstallSnapshotClearsPendingWhenReplaceFails(t *testing.T) {
+	store := &mockStore{}
+	node := newTestNode(t, store)
+	store.setFailReplace(true)
+
+	body, err := json.Marshal(map[string]string{"a": "1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := node.HandleInstallSnapshot(InstallSnapshotRequest{
+		Term:              1,
+		LeaderID:          "n2",
+		LastIncludedIndex: 5,
+		LastIncludedTerm:  1,
+		Offset:            0,
+		Data:              body,
+		Done:              true,
+	})
+
+	if resp.Success {
+		t.Fatal("InstallSnapshot must not report Success when ReplaceEntries fails")
+	}
+
+	node.mu.Lock()
+	snapIdx := node.snapshot.LastIncludedIndex
+	pending := node.pendingSnapshot
+	fatalErr := node.storageFatal
+	node.mu.Unlock()
+	if snapIdx != 0 {
+		t.Fatalf("in-memory snapshot must not advance when WAL replace fails, got LastIncludedIndex=%d", snapIdx)
+	}
+	if pending != nil {
+		t.Fatal("pending snapshot must be cleared after ReplaceEntries failure")
+	}
+	if fatalErr == nil {
+		t.Fatal("node must record a fatal storage error after WAL replace failure")
+	}
+}
+
+func TestHandleInstallSnapshotLeavesMemoryUnchangedWhenHardStateFails(t *testing.T) {
 	store := &mockStore{}
 	sm := newStubSM()
 	node := newTestNodeWithDeps(t, store, sm, stubTransport{})
@@ -412,15 +638,19 @@ func TestHandleInstallSnapshotKeepsMemoryAdvancedWhenHardStateFails(t *testing.T
 	commit := node.commitIndex
 	applied := node.lastApplied
 	pending := node.pendingSnapshot
+	fatalErr := node.storageFatal
 	node.mu.Unlock()
-	if snapIdx != 5 || commit != 5 || applied != 5 {
-		t.Fatalf("memory should keep installed snapshot after disk-first success, got snapshot=%d commit=%d applied=%d", snapIdx, commit, applied)
+	if snapIdx != 0 || commit != 0 || applied != 0 {
+		t.Fatalf("memory should not install snapshot before HardState persists, got snapshot=%d commit=%d applied=%d", snapIdx, commit, applied)
 	}
 	if pending != nil {
-		t.Fatal("pending snapshot should be cleared after local install")
+		t.Fatal("pending snapshot should be cleared after HardState failure")
 	}
-	if got, ok := sm.Get("a"); !ok || got != "1" {
-		t.Fatalf("state machine should be restored from snapshot, got value=%q found=%v", got, ok)
+	if fatalErr == nil {
+		t.Fatal("node must record a fatal storage error after HardState failure")
+	}
+	if got, ok := sm.Get("a"); ok || got != "" {
+		t.Fatalf("state machine should not restore from uncommitted in-memory snapshot, got value=%q found=%v", got, ok)
 	}
 }
 
@@ -566,6 +796,156 @@ func TestProposeFailsWhenWALAppendFails(t *testing.T) {
 	_, err = node.Propose(ctx, storage.Command{Op: storage.OpPut, Key: "again", Value: "v"})
 	if err == nil {
 		t.Fatal("node must reject later proposals after a fatal storage error")
+	}
+}
+
+func TestReplicateToPeerDoesNotRegressMatchIndex(t *testing.T) {
+	entries := make([]storage.LogEntry, 0, 20)
+	for i := 1; i <= 15; i++ {
+		entries = append(entries, storage.LogEntry{
+			Index:   uint64(i),
+			Term:    1,
+			Command: storage.Command{Op: storage.OpPut, Key: "k", Value: "v"},
+		})
+	}
+	store := &mockStore{hs: storage.HardState{CurrentTerm: 1}, entries: entries}
+	transport := &delayedAppendTransport{
+		firstSeen:    make(chan AppendEntriesRequest, 1),
+		secondSeen:   make(chan AppendEntriesRequest, 1),
+		releaseFirst: make(chan struct{}),
+	}
+	node := newTestNodeWithDeps(t, store, newStubSM(), transport)
+
+	node.mu.Lock()
+	node.role = Leader
+	node.currentTerm = 1
+	node.leaderID = node.id
+	node.matchIndex[node.id] = 15
+	node.nextIndex[node.id] = 16
+	node.nextIndex["n2"] = 10
+	node.matchIndex["n2"] = 0
+	node.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	firstDone := make(chan bool, 1)
+	go func() {
+		firstDone <- node.replicateToPeer(ctx, "n2")
+	}()
+
+	firstReq := <-transport.firstSeen
+	if got := firstReq.PrevLogIndex + uint64(len(firstReq.Entries)); got != 15 {
+		t.Fatalf("first request should cover through index 15, got %d", got)
+	}
+
+	node.mu.Lock()
+	for i := 16; i <= 20; i++ {
+		entry := storage.LogEntry{
+			Index:   uint64(i),
+			Term:    1,
+			Command: storage.Command{Op: storage.OpPut, Key: "k", Value: "v"},
+		}
+		node.log = append(node.log, entry)
+	}
+	node.matchIndex[node.id] = 20
+	node.nextIndex[node.id] = 21
+	node.nextIndex["n2"] = 10
+	node.mu.Unlock()
+
+	if ok := node.replicateToPeer(ctx, "n2"); !ok {
+		t.Fatal("second replication should succeed")
+	}
+	secondReq := <-transport.secondSeen
+	if got := secondReq.PrevLogIndex + uint64(len(secondReq.Entries)); got != 20 {
+		t.Fatalf("second request should cover through index 20, got %d", got)
+	}
+
+	node.mu.Lock()
+	matchAfterSecond := node.matchIndex["n2"]
+	nextAfterSecond := node.nextIndex["n2"]
+	node.mu.Unlock()
+	if matchAfterSecond != 20 || nextAfterSecond != 21 {
+		t.Fatalf("second response should advance peer to 20/21, got match=%d next=%d", matchAfterSecond, nextAfterSecond)
+	}
+
+	close(transport.releaseFirst)
+	select {
+	case ok := <-firstDone:
+		if !ok {
+			t.Fatal("first replication should still report a successful ack")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first replication")
+	}
+
+	node.mu.Lock()
+	match := node.matchIndex["n2"]
+	next := node.nextIndex["n2"]
+	node.mu.Unlock()
+	if match != 20 || next != 21 {
+		t.Fatalf("late stale response must not regress peer progress, got match=%d next=%d", match, next)
+	}
+}
+
+func TestReplicateAllOnceSkipsPeerAlreadyInFlight(t *testing.T) {
+	store := &mockStore{hs: storage.HardState{CurrentTerm: 1}}
+	transport := &blockingAppendTransport{
+		started: make(chan string, 4),
+		release: make(chan struct{}),
+	}
+	node := newTestNodeWithDeps(t, store, newStubSM(), transport)
+
+	node.mu.Lock()
+	node.role = Leader
+	node.currentTerm = 1
+	node.leaderID = node.id
+	node.matchIndex[node.id] = 0
+	node.nextIndex[node.id] = 1
+	for peerID := range node.peerAddrs {
+		node.nextIndex[peerID] = 1
+		node.matchIndex[peerID] = 0
+	}
+	node.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- node.replicateAllOnce(ctx)
+	}()
+
+	for i := 0; i < len(node.peerAddrs); i++ {
+		select {
+		case <-transport.started:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for initial replication")
+		}
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- node.replicateAllOnce(ctx)
+	}()
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("second replicateAllOnce returned error: %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("second replicateAllOnce should return immediately when peers are in flight")
+	}
+	if got := transport.callCount(); got != len(node.peerAddrs) {
+		t.Fatalf("expected only the first wave of RPCs, got %d calls", got)
+	}
+
+	close(transport.release)
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first replicateAllOnce returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first replicateAllOnce")
 	}
 }
 
@@ -761,6 +1141,81 @@ func TestInstallSnapshotSerializesWithInFlightApply(t *testing.T) {
 
 	if value, found := sm.Get("k"); !found || value != "new" {
 		t.Fatalf("snapshot value should win after serialization, got value=%q found=%v", value, found)
+	}
+}
+
+func TestSlowApplyDoesNotBlockRequestVote(t *testing.T) {
+	store := &mockStore{
+		hs: storage.HardState{CurrentTerm: 1},
+		entries: []storage.LogEntry{
+			{Index: 1, Term: 1, Command: storage.Command{Op: storage.OpPut, Key: "k", Value: "old"}},
+		},
+	}
+	sm := newBlockingApplySM()
+	node := newTestNodeWithDeps(t, store, sm, stubTransport{})
+
+	node.mu.Lock()
+	node.commitIndex = 1
+	node.mu.Unlock()
+
+	applyDone := make(chan struct{})
+	go func() {
+		node.applyReady()
+		close(applyDone)
+	}()
+
+	select {
+	case <-sm.applyStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for apply to start")
+	}
+
+	voteDone := make(chan RequestVoteResponse, 1)
+	go func() {
+		voteDone <- node.HandleRequestVote(RequestVoteRequest{
+			Term:         2,
+			CandidateID:  "n2",
+			LastLogIndex: 1,
+			LastLogTerm:  1,
+		})
+	}()
+
+	select {
+	case <-voteDone:
+	case <-time.After(100 * time.Millisecond):
+		close(sm.releaseApply)
+		t.Fatal("RequestVote should not wait for a slow state-machine Apply")
+	}
+
+	close(sm.releaseApply)
+	select {
+	case <-applyDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for apply to finish")
+	}
+}
+
+func TestWaitUntilAppliedReturnsOnStorageFailure(t *testing.T) {
+	store := &mockStore{}
+	node := newTestNode(t, store)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- node.waitUntilApplied(context.Background(), 1)
+	}()
+
+	storageErr := errors.New("disk failed")
+	node.mu.Lock()
+	node.failStorageLocked(storageErr)
+	node.mu.Unlock()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, storageErr) {
+			t.Fatalf("expected storage error, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitUntilApplied should wake when storage becomes fatal")
 	}
 }
 

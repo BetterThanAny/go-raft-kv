@@ -205,7 +205,7 @@ func call[T any](ctx context.Context, endpoint string, fn func(context.Context, 
 	var zero T
 	callCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 	defer cancel()
-	conn, err := grpc.DialContext(callCtx, endpoint, append(api.DialOptions(), grpc.WithBlock())...)
+	conn, err := grpc.NewClient(endpoint, api.DialOptions()...)
 	if err != nil {
 		return zero, err
 	}
