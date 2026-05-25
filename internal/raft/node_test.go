@@ -333,12 +333,17 @@ func newTestNode(t *testing.T, store Store) *Node {
 
 func newTestNodeWithDeps(t *testing.T, store Store, sm StateMachine, transport Transport) *Node {
 	t.Helper()
-	node, err := NewNode(Config{
+	return newTestNodeWithConfig(t, Config{
 		ID:              "n1",
 		Address:         "n1",
 		Peers:           map[string]string{"n1": "n1", "n2": "n2", "n3": "n3"},
 		ClientAddresses: map[string]string{},
 	}, store, sm, transport)
+}
+
+func newTestNodeWithConfig(t *testing.T, cfg Config, store Store, sm StateMachine, transport Transport) *Node {
+	t.Helper()
+	node, err := NewNode(cfg, store, sm, transport)
 	if err != nil {
 		t.Fatalf("NewNode: %v", err)
 	}
@@ -370,6 +375,45 @@ func TestHandleRequestVoteRejectsWhenHardStateFails(t *testing.T) {
 	}
 	if votedFor != "" {
 		t.Fatalf("votedFor should have rolled back to empty, got %q", votedFor)
+	}
+}
+
+func TestBecomeFollowerRollbackRestoresElectionDue(t *testing.T) {
+	store := &mockStore{hs: storage.HardState{CurrentTerm: 1}}
+	node := newTestNode(t, store)
+
+	node.mu.Lock()
+	node.role = Leader
+	node.currentTerm = 1
+	node.leaderID = node.id
+	node.leaderNoopIndex = 7
+	node.lastQuorumContact = time.Now()
+	node.electionDue = time.Now().Add(123 * time.Millisecond)
+	prevElectionDue := node.electionDue
+	prevQuorumContact := node.lastQuorumContact
+	node.mu.Unlock()
+
+	store.setFailHardState(true)
+
+	node.mu.Lock()
+	err := node.becomeFollowerLocked(2, "n2")
+	role := node.role
+	term := node.currentTerm
+	electionDue := node.electionDue
+	quorumContact := node.lastQuorumContact
+	node.mu.Unlock()
+
+	if err == nil {
+		t.Fatal("expected becomeFollowerLocked to surface HardState failure")
+	}
+	if role != Leader || term != 1 {
+		t.Fatalf("role/term should roll back to leader term 1, got role=%s term=%d", role, term)
+	}
+	if !electionDue.Equal(prevElectionDue) {
+		t.Fatalf("electionDue should roll back, got %s want %s", electionDue, prevElectionDue)
+	}
+	if !quorumContact.Equal(prevQuorumContact) {
+		t.Fatalf("lastQuorumContact should roll back, got %s want %s", quorumContact, prevQuorumContact)
 	}
 }
 
@@ -799,6 +843,80 @@ func TestProposeFailsWhenWALAppendFails(t *testing.T) {
 	}
 }
 
+func TestProposeReturnsNodeStoppedAfterStop(t *testing.T) {
+	store := &mockStore{}
+	node := newTestNode(t, store)
+
+	node.mu.Lock()
+	node.role = Leader
+	node.currentTerm = 1
+	node.leaderID = node.id
+	node.matchIndex[node.id] = 0
+	node.nextIndex[node.id] = 1
+	node.mu.Unlock()
+
+	node.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := node.Propose(ctx, storage.Command{Op: storage.OpPut, Key: "k", Value: "v"})
+	if !errors.Is(err, ErrNodeStopped) {
+		t.Fatalf("expected ErrNodeStopped from Propose after Stop, got %v", err)
+	}
+	_, _, err = node.LinearizableGet(ctx, "k")
+	if !errors.Is(err, ErrNodeStopped) {
+		t.Fatalf("expected ErrNodeStopped from LinearizableGet after Stop, got %v", err)
+	}
+	appendCalls, _, _ := store.callCounts()
+	if appendCalls != 0 {
+		t.Fatalf("stopped node must not append new proposals, got %d appends", appendCalls)
+	}
+}
+
+func TestStopDrainsInFlightProposal(t *testing.T) {
+	store := &mockStore{}
+	node := newTestNode(t, store)
+
+	node.mu.Lock()
+	node.role = Leader
+	node.currentTerm = 1
+	node.leaderID = node.id
+	node.matchIndex[node.id] = 0
+	node.nextIndex[node.id] = 1
+	node.mu.Unlock()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := node.Propose(context.Background(), storage.Command{Op: storage.OpPut, Key: "k", Value: "v"})
+		errCh <- err
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		node.mu.Lock()
+		waiters := len(node.waiters[1])
+		node.mu.Unlock()
+		if waiters == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for proposal waiter")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	node.Stop()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrNodeStopped) {
+			t.Fatalf("expected ErrNodeStopped for drained proposal, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Stop should unblock an in-flight proposal")
+	}
+}
+
 func TestReplicateToPeerDoesNotRegressMatchIndex(t *testing.T) {
 	entries := make([]storage.LogEntry, 0, 20)
 	for i := 1; i <= 15; i++ {
@@ -949,6 +1067,57 @@ func TestReplicateAllOnceSkipsPeerAlreadyInFlight(t *testing.T) {
 	}
 }
 
+func TestEnsureQuorumWaitsForPeerReplicationSlot(t *testing.T) {
+	store := &mockStore{hs: storage.HardState{CurrentTerm: 1}}
+	transport := &appendAckTransport{requests: make(chan AppendEntriesRequest, 8)}
+	node := newTestNodeWithDeps(t, store, newStubSM(), transport)
+
+	node.mu.Lock()
+	node.role = Leader
+	node.currentTerm = 1
+	node.leaderID = node.id
+	node.matchIndex[node.id] = 0
+	node.nextIndex[node.id] = 1
+	for peerID := range node.peerAddrs {
+		node.nextIndex[peerID] = 1
+		node.matchIndex[peerID] = 0
+		node.replicating[peerID] = true
+	}
+	node.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := node.ensureQuorum(ctx)
+		readDone <- err
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	if got := len(transport.requests); got != 0 {
+		t.Fatalf("ensureQuorum must not send while peers are in flight, got %d requests", got)
+	}
+
+	node.mu.Lock()
+	for peerID := range node.peerAddrs {
+		delete(node.replicating, peerID)
+	}
+	node.mu.Unlock()
+
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatalf("ensureQuorum returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for ensureQuorum")
+	}
+	if got := len(transport.requests); got == 0 {
+		t.Fatal("ensureQuorum should run a barrier after the slot frees")
+	}
+}
+
 func TestLinearizableGetWaitsForLeaderNoopApplied(t *testing.T) {
 	store := &mockStore{
 		hs: storage.HardState{CurrentTerm: 2, CommitIndex: 1},
@@ -1072,6 +1241,96 @@ func TestLinearizableGetDefaultReadTimeout(t *testing.T) {
 	}
 }
 
+func TestLinearizableGetRefreshesExpiredLeaseAfterApplyWait(t *testing.T) {
+	store := &mockStore{
+		hs: storage.HardState{CurrentTerm: 2},
+		entries: []storage.LogEntry{
+			{Index: 1, Term: 2, Command: storage.Command{Op: storage.OpPut, Key: "k", Value: "old"}},
+		},
+	}
+	transport := &appendAckTransport{requests: make(chan AppendEntriesRequest, 8)}
+	sm := newBlockingApplySM()
+	node := newTestNodeWithConfig(t, Config{
+		ID:                 "n1",
+		Address:            "n1",
+		Peers:              map[string]string{"n1": "n1", "n2": "n2"},
+		ClientAddresses:    map[string]string{},
+		ElectionTimeoutMin: 40 * time.Millisecond,
+		ElectionTimeoutMax: 80 * time.Millisecond,
+		ReadTimeout:        time.Second,
+	}, store, sm, transport)
+
+	node.mu.Lock()
+	node.role = Leader
+	node.currentTerm = 2
+	node.leaderID = node.id
+	node.commitIndex = 1
+	node.lastApplied = 0
+	node.matchIndex[node.id] = 1
+	node.nextIndex[node.id] = 2
+	node.nextIndex["n2"] = 2
+	node.matchIndex["n2"] = 0
+	node.mu.Unlock()
+
+	applyDone := make(chan struct{})
+	go func() {
+		node.applyReady()
+		close(applyDone)
+	}()
+	select {
+	case <-sm.applyStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for apply to start")
+	}
+
+	type readResult struct {
+		value string
+		found bool
+		err   error
+	}
+	readDone := make(chan readResult, 1)
+	go func() {
+		value, found, err := node.LinearizableGet(context.Background(), "k")
+		readDone <- readResult{value: value, found: found, err: err}
+	}()
+
+	select {
+	case <-transport.requests:
+	case <-time.After(time.Second):
+		close(sm.releaseApply)
+		t.Fatal("timed out waiting for initial read barrier")
+	}
+
+	time.Sleep(node.readLeaseDuration() + 20*time.Millisecond)
+	close(sm.releaseApply)
+
+	select {
+	case <-applyDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for apply to finish")
+	}
+
+	select {
+	case <-transport.requests:
+	case res := <-readDone:
+		t.Fatalf("read returned without refreshing the expired lease: %+v", res)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for refreshed read barrier")
+	}
+
+	select {
+	case res := <-readDone:
+		if res.err != nil {
+			t.Fatalf("LinearizableGet failed: %v", res.err)
+		}
+		if !res.found || res.value != "old" {
+			t.Fatalf("expected applied value, got value=%q found=%v", res.value, res.found)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for LinearizableGet")
+	}
+}
+
 func TestInstallSnapshotSerializesWithInFlightApply(t *testing.T) {
 	store := &mockStore{
 		hs: storage.HardState{CurrentTerm: 1},
@@ -1141,6 +1400,51 @@ func TestInstallSnapshotSerializesWithInFlightApply(t *testing.T) {
 
 	if value, found := sm.Get("k"); !found || value != "new" {
 		t.Fatalf("snapshot value should win after serialization, got value=%q found=%v", value, found)
+	}
+}
+
+func TestApplyReadyRechecksEntryTermAfterApply(t *testing.T) {
+	store := &mockStore{
+		hs: storage.HardState{CurrentTerm: 1},
+		entries: []storage.LogEntry{
+			{Index: 1, Term: 1, Command: storage.Command{Op: storage.OpPut, Key: "k", Value: "old"}},
+		},
+	}
+	sm := newBlockingApplySM()
+	node := newTestNodeWithDeps(t, store, sm, stubTransport{})
+
+	node.mu.Lock()
+	node.commitIndex = 1
+	node.mu.Unlock()
+
+	applyDone := make(chan struct{})
+	go func() {
+		node.applyReady()
+		close(applyDone)
+	}()
+
+	select {
+	case <-sm.applyStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for apply to start")
+	}
+
+	node.mu.Lock()
+	node.log[0].Term = 2
+	node.mu.Unlock()
+	close(sm.releaseApply)
+
+	select {
+	case <-applyDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for applyReady")
+	}
+
+	node.mu.Lock()
+	lastApplied := node.lastApplied
+	node.mu.Unlock()
+	if lastApplied != 0 {
+		t.Fatalf("lastApplied must not advance after entry term changes, got %d", lastApplied)
 	}
 }
 

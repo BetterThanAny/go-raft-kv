@@ -18,6 +18,7 @@ const (
 )
 
 var ErrNotLeader = errors.New("not leader")
+var ErrNodeStopped = errors.New("node stopped")
 
 type NotLeaderError struct {
 	LeaderID      string

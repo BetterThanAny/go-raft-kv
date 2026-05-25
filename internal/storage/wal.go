@@ -102,9 +102,18 @@ func (s *Store) AppendEntries(entries []LogEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Detect first-time creation so we know whether to fsync the parent dir.
-	_, statErr := os.Stat(s.wal)
+	// Detect first-time creation so we know whether to write the base record and
+	// fsync the parent dir. A zero-byte WAL is treated like a new WAL: appending
+	// entries without the base record would make snapshot reconciliation discard
+	// an otherwise valid suffix on restart.
+	info, statErr := os.Stat(s.wal)
 	created := errors.Is(statErr, os.ErrNotExist)
+	if statErr != nil && !created {
+		return statErr
+	}
+	if statErr == nil && info.Size() == 0 {
+		created = true
+	}
 	baseIndex, baseTerm := uint64(0), uint64(0)
 	if created {
 		var err error
