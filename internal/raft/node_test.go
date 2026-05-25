@@ -369,16 +369,20 @@ func TestHandleRequestVoteRejectsWhenHardStateFails(t *testing.T) {
 	node.mu.Lock()
 	term := node.currentTerm
 	votedFor := node.votedFor
+	fatalErr := node.storageFatal
 	node.mu.Unlock()
-	if term != 0 {
-		t.Fatalf("currentTerm should have rolled back to 0 after persist failure, got %d", term)
+	if term != 5 {
+		t.Fatalf("currentTerm should stay at the observed higher term, got %d", term)
 	}
 	if votedFor != "" {
-		t.Fatalf("votedFor should have rolled back to empty, got %q", votedFor)
+		t.Fatalf("votedFor should remain empty after failed vote persistence, got %q", votedFor)
+	}
+	if fatalErr == nil {
+		t.Fatal("HardState failure after observing a higher term must make the node fail closed")
 	}
 }
 
-func TestBecomeFollowerRollbackRestoresElectionDue(t *testing.T) {
+func TestBecomeFollowerFailsClosedWhenHardStateFails(t *testing.T) {
 	store := &mockStore{hs: storage.HardState{CurrentTerm: 1}}
 	node := newTestNode(t, store)
 
@@ -387,8 +391,6 @@ func TestBecomeFollowerRollbackRestoresElectionDue(t *testing.T) {
 	node.currentTerm = 1
 	node.leaderID = node.id
 	node.leaderNoopIndex = 7
-	node.electionDue = time.Now().Add(123 * time.Millisecond)
-	prevElectionDue := node.electionDue
 	node.mu.Unlock()
 
 	store.setFailHardState(true)
@@ -397,17 +399,21 @@ func TestBecomeFollowerRollbackRestoresElectionDue(t *testing.T) {
 	err := node.becomeFollowerLocked(2, "n2")
 	role := node.role
 	term := node.currentTerm
-	electionDue := node.electionDue
+	fatalErr := node.storageFatal
+	leaderNoop := node.leaderNoopIndex
 	node.mu.Unlock()
 
 	if err == nil {
 		t.Fatal("expected becomeFollowerLocked to surface HardState failure")
 	}
-	if role != Leader || term != 1 {
-		t.Fatalf("role/term should roll back to leader term 1, got role=%s term=%d", role, term)
+	if role != Follower || term != 2 {
+		t.Fatalf("node must fail closed as follower at observed term, got role=%s term=%d", role, term)
 	}
-	if !electionDue.Equal(prevElectionDue) {
-		t.Fatalf("electionDue should roll back, got %s want %s", electionDue, prevElectionDue)
+	if leaderNoop != 0 {
+		t.Fatalf("leaderNoopIndex must be cleared after failed stepdown persist, got %d", leaderNoop)
+	}
+	if fatalErr == nil {
+		t.Fatal("HardState failure while stepping down must mark storage fatal")
 	}
 }
 
@@ -1277,6 +1283,75 @@ func TestLinearizableGetDefaultReadTimeout(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("read timeout took too long: %s", elapsed)
+	}
+}
+
+func TestLinearizableGetReturnsNotLeaderWhenSteppingDownWhileWaitingForApply(t *testing.T) {
+	store := &mockStore{
+		hs: storage.HardState{CurrentTerm: 2, CommitIndex: 1},
+		entries: []storage.LogEntry{
+			{Index: 1, Term: 1, Command: storage.Command{Op: storage.OpPut, Key: "kept", Value: "old"}},
+			{Index: 2, Term: 2, Command: storage.Command{Op: storage.OpNoop}},
+		},
+	}
+	transport := &appendAckTransport{requests: make(chan AppendEntriesRequest, 4)}
+	node := newTestNodeWithDeps(t, store, newStubSM(), transport)
+
+	node.mu.Lock()
+	node.role = Leader
+	node.currentTerm = 2
+	node.leaderID = node.id
+	node.commitIndex = 1
+	node.lastApplied = 1
+	node.leaderNoopIndex = 2
+	node.matchIndex[node.id] = 2
+	node.nextIndex[node.id] = 3
+	for peerID := range node.peerAddrs {
+		node.nextIndex[peerID] = 2
+		node.matchIndex[peerID] = 0
+	}
+	node.mu.Unlock()
+
+	errCh := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	go func() {
+		_, _, err := node.LinearizableGet(ctx, "kept")
+		errCh <- err
+	}()
+
+	select {
+	case req := <-transport.requests:
+		if len(req.Entries) == 0 {
+			t.Fatal("read barrier should replicate the unapplied leader no-op")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for read barrier")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		node.mu.Lock()
+		committed := node.commitIndex >= 2
+		node.mu.Unlock()
+		if committed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for read barrier to commit the no-op")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	node.stepDown(3, "n2")
+
+	select {
+	case err := <-errCh:
+		if !IsNotLeader(err) {
+			t.Fatalf("expected NotLeader after stepdown, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("LinearizableGet should wake when the leader steps down")
 	}
 }
 

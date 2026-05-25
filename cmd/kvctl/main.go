@@ -166,15 +166,13 @@ type endpointCaller[T any] func(context.Context, string, func(context.Context, *
 func withLeaderRetryUsing[T any](ctx context.Context, endpoints []string, fn func(context.Context, *api.KVClient) (T, error), caller endpointCaller[T]) (T, error) {
 	var zero T
 	queue := append([]string(nil), endpoints...)
-	seen := map[string]bool{}
 	var lastErr error
 	for attempts := 0; attempts < len(endpoints)+5 && len(queue) > 0; attempts++ {
 		endpoint := queue[0]
 		queue = queue[1:]
-		if endpoint == "" || seen[endpoint] {
+		if endpoint == "" {
 			continue
 		}
-		seen[endpoint] = true
 		resp, err := caller(ctx, endpoint, fn)
 		if err != nil {
 			lastErr = err

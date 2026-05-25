@@ -362,7 +362,7 @@ func (n *Node) LinearizableGet(ctx context.Context, key string) (string, bool, e
 		}
 		n.mu.Unlock()
 
-		if err := n.waitUntilApplied(readCtx, applied); err != nil {
+		if err := n.waitUntilAppliedAsLeader(readCtx, applied, confirmedTerm); err != nil {
 			return "", false, err
 		}
 
@@ -380,9 +380,8 @@ func (n *Node) LinearizableGet(ctx context.Context, key string) (string, bool, e
 			n.mu.Unlock()
 			continue
 		}
-		n.mu.Unlock()
-
 		value, found := readValue(n.sm, key)
+		n.mu.Unlock()
 		return value, found, nil
 	}
 }
@@ -891,17 +890,11 @@ func (n *Node) stepDown(term uint64, leaderID string) {
 	_ = n.becomeFollowerLocked(term, leaderID)
 }
 
-// becomeFollowerLocked transitions to follower. If persistence of the
-// (possibly new) term/votedFor fails, the in-memory term/votedFor are rolled
-// back so we never advertise a term that isn't durably recorded — preventing
-// vote duplication across a crash and restart.
+// becomeFollowerLocked transitions to follower. If persistence of the new
+// HardState fails, the node fails closed: it must not keep acting as an old
+// leader after observing a higher term or another leader in the current term.
 func (n *Node) becomeFollowerLocked(term uint64, leaderID string) error {
-	prevTerm := n.currentTerm
-	prevVotedFor := n.votedFor
 	prevRole := n.role
-	prevLeader := n.leaderID
-	prevLeaderNoop := n.leaderNoopIndex
-	prevElectionDue := n.electionDue
 	if term > n.currentTerm {
 		n.currentTerm = term
 		n.votedFor = ""
@@ -911,12 +904,7 @@ func (n *Node) becomeFollowerLocked(term uint64, leaderID string) error {
 	n.leaderNoopIndex = 0
 	n.resetElectionLocked()
 	if err := n.persistHardStateLocked(); err != nil {
-		n.currentTerm = prevTerm
-		n.votedFor = prevVotedFor
-		n.role = prevRole
-		n.leaderID = prevLeader
-		n.leaderNoopIndex = prevLeaderNoop
-		n.electionDue = prevElectionDue
+		n.failStorageLocked(err)
 		return err
 	}
 	if prevRole == Leader {
@@ -926,6 +914,7 @@ func (n *Node) becomeFollowerLocked(term uint64, leaderID string) error {
 		// commitIndex stay in n.waiters so the apply loop can still deliver
 		// the real result if/when those entries are applied locally.
 		n.failUncommittedWaitersLocked()
+		n.applyCond.Broadcast()
 	}
 	return nil
 }
@@ -1663,6 +1652,43 @@ func (n *Node) waitUntilApplied(ctx context.Context, index uint64) error {
 			return err
 		}
 		n.applyCond.Wait()
+	}
+	return nil
+}
+
+func (n *Node) waitUntilAppliedAsLeader(ctx context.Context, index, term uint64) error {
+	stop := context.AfterFunc(ctx, func() {
+		n.mu.Lock()
+		n.applyCond.Broadcast()
+		n.mu.Unlock()
+	})
+	defer stop()
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for n.lastApplied < index {
+		if n.stopped {
+			return ErrNodeStopped
+		}
+		if n.storageFatal != nil {
+			return n.storageFatal
+		}
+		if n.role != Leader || n.currentTerm != term {
+			return n.notLeaderLocked()
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n.applyCond.Wait()
+	}
+	if n.stopped {
+		return ErrNodeStopped
+	}
+	if n.storageFatal != nil {
+		return n.storageFatal
+	}
+	if n.role != Leader || n.currentTerm != term {
+		return n.notLeaderLocked()
 	}
 	return nil
 }
