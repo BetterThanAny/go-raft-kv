@@ -39,7 +39,6 @@ type snapshotProgress struct {
 const defaultSnapshotChunkBytes = 1 << 20 // 1 MiB
 const maxReplicationAttempts = 128
 const replicationSlotPoll = 2 * time.Millisecond
-const readLeaseClockDrift = 10 * time.Millisecond
 
 type Node struct {
 	id          string
@@ -76,7 +75,6 @@ type Node struct {
 	lastErr            error
 	storageFatal       error
 	stopped            bool
-	lastQuorumContact  time.Time
 
 	proposeMu         sync.Mutex
 	applyMu           sync.Mutex
@@ -339,7 +337,8 @@ func (n *Node) LinearizableGet(ctx context.Context, key string) (string, bool, e
 	defer cancel()
 
 	for {
-		if _, err := n.ensureQuorum(readCtx); err != nil {
+		confirmedTerm, err := n.ensureQuorum(readCtx)
+		if err != nil {
 			return "", false, err
 		}
 
@@ -352,6 +351,10 @@ func (n *Node) LinearizableGet(ctx context.Context, key string) (string, bool, e
 			err := n.notLeaderLocked()
 			n.mu.Unlock()
 			return "", false, err
+		}
+		if n.currentTerm != confirmedTerm {
+			n.mu.Unlock()
+			continue
 		}
 		applied := n.commitIndex
 		if n.leaderNoopIndex > applied {
@@ -373,7 +376,7 @@ func (n *Node) LinearizableGet(ctx context.Context, key string) (string, bool, e
 			n.mu.Unlock()
 			return "", false, err
 		}
-		if !n.readLeaseValidLocked(time.Now()) {
+		if n.currentTerm != confirmedTerm {
 			n.mu.Unlock()
 			continue
 		}
@@ -556,9 +559,10 @@ func (n *Node) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshot
 	n.leaderID = req.LeaderID
 	n.resetElectionLocked()
 
-	if req.LastIncludedIndex <= n.lastApplied {
-		// Already applied at or beyond this snapshot. Installing it would roll the
-		// state machine back, so ack it as stale and let the leader advance.
+	if req.LastIncludedIndex <= n.commitIndex {
+		// Already committed at or beyond this snapshot. Installing it could roll
+		// back committed-but-not-yet-applied entries, so ack it as stale and let
+		// the leader advance with AppendEntries if any suffix is still needed.
 		n.pendingSnapshot = nil
 		term := n.currentTerm
 		n.mu.Unlock()
@@ -646,7 +650,7 @@ func (n *Node) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshot
 	}
 	n.leaderID = req.LeaderID
 	n.resetElectionLocked()
-	if req.LastIncludedIndex <= n.lastApplied {
+	if req.LastIncludedIndex <= n.commitIndex {
 		n.pendingSnapshot = nil
 		return InstallSnapshotResponse{Term: n.currentTerm, Success: true}
 	}
@@ -848,7 +852,6 @@ func (n *Node) becomeLeader(term uint64) {
 	n.replicating = make(map[string]bool)
 	n.matchIndex[n.id] = last
 	n.nextIndex[n.id] = last + 1
-	n.lastQuorumContact = time.Time{}
 	for peerID := range n.peerAddrs {
 		n.nextIndex[peerID] = last + 1
 		n.matchIndex[peerID] = 0
@@ -899,7 +902,6 @@ func (n *Node) becomeFollowerLocked(term uint64, leaderID string) error {
 	prevLeader := n.leaderID
 	prevLeaderNoop := n.leaderNoopIndex
 	prevElectionDue := n.electionDue
-	prevQuorumContact := n.lastQuorumContact
 	if term > n.currentTerm {
 		n.currentTerm = term
 		n.votedFor = ""
@@ -907,7 +909,6 @@ func (n *Node) becomeFollowerLocked(term uint64, leaderID string) error {
 	n.role = Follower
 	n.leaderID = leaderID
 	n.leaderNoopIndex = 0
-	n.lastQuorumContact = time.Time{}
 	n.resetElectionLocked()
 	if err := n.persistHardStateLocked(); err != nil {
 		n.currentTerm = prevTerm
@@ -916,7 +917,6 @@ func (n *Node) becomeFollowerLocked(term uint64, leaderID string) error {
 		n.leaderID = prevLeader
 		n.leaderNoopIndex = prevLeaderNoop
 		n.electionDue = prevElectionDue
-		n.lastQuorumContact = prevQuorumContact
 		return err
 	}
 	if prevRole == Leader {
@@ -939,7 +939,6 @@ func (n *Node) failStorageLocked(err error) {
 	n.role = Follower
 	n.leaderID = ""
 	n.leaderNoopIndex = 0
-	n.lastQuorumContact = time.Time{}
 	n.resetElectionLocked()
 	n.failUncommittedWaitersLocked()
 	n.applyCond.Broadcast()
@@ -973,7 +972,6 @@ func (n *Node) replicateAllOnce(ctx context.Context) error {
 		n.mu.Unlock()
 		return err
 	}
-	term := n.currentTerm
 	peers := make([]string, 0, len(n.peerAddrs))
 	for peerID := range n.peerAddrs {
 		if n.replicating[peerID] {
@@ -997,21 +995,10 @@ func (n *Node) replicateAllOnce(ctx context.Context) error {
 		}(peerID)
 	}
 
-	acked := 1 // self
-	var quorumAt time.Time
 	for range peers {
-		ok := <-acks
-		if ok {
-			acked++
-			if acked >= n.quorum() && quorumAt.IsZero() {
-				quorumAt = time.Now()
-			}
-		}
+		<-acks
 	}
 	wg.Wait()
-	if !quorumAt.IsZero() {
-		n.recordQuorumContact(term, quorumAt)
-	}
 	return nil
 }
 
@@ -1226,41 +1213,34 @@ func (n *Node) sendSnapshot(ctx context.Context, peerID string, term, lastIdx, l
 	}
 }
 
-// ensureQuorum implements the read barrier (Raft §6.4 readIndex) plus a bounded
-// leader lease: it reuses a recent current-term quorum contact while the lease is
-// valid, otherwise it dispatches a fresh round of AppendEntries/InstallSnapshot
-// RPCs. Counting fresh ack (not cumulative matchIndex) is critical — otherwise a
-// partitioned leader can pass the barrier on stale matchIndex values.
-func (n *Node) ensureQuorum(ctx context.Context) (time.Time, error) {
+// ensureQuorum implements the read barrier (Raft §6.4 readIndex): every read
+// dispatches a fresh round of current-term AppendEntries/InstallSnapshot RPCs
+// and succeeds only after this specific call receives a majority. Counting fresh
+// acks (not cumulative matchIndex) is critical — otherwise a partitioned leader
+// can pass the barrier on stale matchIndex values.
+func (n *Node) ensureQuorum(ctx context.Context) (uint64, error) {
 	if n.quorum() == 1 {
 		n.mu.Lock()
 		defer n.mu.Unlock()
 		if n.stopped {
-			return time.Time{}, ErrNodeStopped
+			return 0, ErrNodeStopped
 		}
 		if n.role != Leader {
-			return time.Time{}, n.notLeaderLocked()
+			return 0, n.notLeaderLocked()
 		}
-		now := time.Now()
-		n.lastQuorumContact = now
-		return now, nil
+		return n.currentTerm, nil
 	}
 	n.mu.Lock()
 	if n.stopped {
 		n.mu.Unlock()
-		return time.Time{}, ErrNodeStopped
+		return 0, ErrNodeStopped
 	}
 	if n.role != Leader {
 		err := n.notLeaderLocked()
 		n.mu.Unlock()
-		return time.Time{}, err
+		return 0, err
 	}
 	term := n.currentTerm
-	if n.readLeaseValidLocked(time.Now()) {
-		contact := n.lastQuorumContact
-		n.mu.Unlock()
-		return contact, nil
-	}
 	peers := make([]string, 0, len(n.peerAddrs))
 	for peerID := range n.peerAddrs {
 		peers = append(peers, peerID)
@@ -1275,7 +1255,7 @@ func (n *Node) ensureQuorum(ctx context.Context) (time.Time, error) {
 		acked    = 1 // count self
 		failed   = 0
 		target   = n.quorum()
-		ackedAt  time.Time
+		ackedAt  bool
 		quorumCh = make(chan struct{}, 1)
 		doneCh   = make(chan struct{}, 1)
 	)
@@ -1284,9 +1264,7 @@ func (n *Node) ensureQuorum(ctx context.Context) (time.Time, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		if acked >= target {
-			if ackedAt.IsZero() {
-				ackedAt = time.Now()
-			}
+			ackedAt = true
 			select {
 			case quorumCh <- struct{}{}:
 			default:
@@ -1329,23 +1307,22 @@ func (n *Node) ensureQuorum(ctx context.Context) (time.Time, error) {
 		n.mu.Lock()
 		defer n.mu.Unlock()
 		if n.stopped {
-			return time.Time{}, ErrNodeStopped
+			return 0, ErrNodeStopped
 		}
 		if n.role != Leader || n.currentTerm != term {
-			return time.Time{}, n.notLeaderLocked()
+			return 0, n.notLeaderLocked()
 		}
 		mu.Lock()
-		contact := ackedAt
+		ok := ackedAt
 		mu.Unlock()
-		if contact.IsZero() {
-			contact = time.Now()
+		if !ok {
+			return 0, errors.New("leader cannot contact quorum")
 		}
-		n.lastQuorumContact = contact
-		return contact, nil
+		return term, nil
 	case <-doneCh:
-		return time.Time{}, errors.New("leader cannot contact quorum")
+		return 0, errors.New("leader cannot contact quorum")
 	case <-ctx.Done():
-		return time.Time{}, ctx.Err()
+		return 0, ctx.Err()
 	}
 }
 
@@ -1688,36 +1665,6 @@ func (n *Node) waitUntilApplied(ctx context.Context, index uint64) error {
 		n.applyCond.Wait()
 	}
 	return nil
-}
-
-func (n *Node) recordQuorumContact(term uint64, at time.Time) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if n.stopped || n.role != Leader || n.currentTerm != term {
-		return
-	}
-	n.lastQuorumContact = at
-}
-
-func (n *Node) readLeaseValidLocked(now time.Time) bool {
-	if n.stopped || n.role != Leader {
-		return false
-	}
-	if n.quorum() == 1 {
-		return true
-	}
-	if n.lastQuorumContact.IsZero() {
-		return false
-	}
-	lease := n.readLeaseDuration()
-	return lease > 0 && now.Sub(n.lastQuorumContact) < lease
-}
-
-func (n *Node) readLeaseDuration() time.Duration {
-	if n.timeoutMin <= readLeaseClockDrift {
-		return n.timeoutMin / 2
-	}
-	return n.timeoutMin - readLeaseClockDrift
 }
 
 func (n *Node) quorum() int {

@@ -387,10 +387,8 @@ func TestBecomeFollowerRollbackRestoresElectionDue(t *testing.T) {
 	node.currentTerm = 1
 	node.leaderID = node.id
 	node.leaderNoopIndex = 7
-	node.lastQuorumContact = time.Now()
 	node.electionDue = time.Now().Add(123 * time.Millisecond)
 	prevElectionDue := node.electionDue
-	prevQuorumContact := node.lastQuorumContact
 	node.mu.Unlock()
 
 	store.setFailHardState(true)
@@ -400,7 +398,6 @@ func TestBecomeFollowerRollbackRestoresElectionDue(t *testing.T) {
 	role := node.role
 	term := node.currentTerm
 	electionDue := node.electionDue
-	quorumContact := node.lastQuorumContact
 	node.mu.Unlock()
 
 	if err == nil {
@@ -411,9 +408,6 @@ func TestBecomeFollowerRollbackRestoresElectionDue(t *testing.T) {
 	}
 	if !electionDue.Equal(prevElectionDue) {
 		t.Fatalf("electionDue should roll back, got %s want %s", electionDue, prevElectionDue)
-	}
-	if !quorumContact.Equal(prevQuorumContact) {
-		t.Fatalf("lastQuorumContact should roll back, got %s want %s", quorumContact, prevQuorumContact)
 	}
 }
 
@@ -735,6 +729,51 @@ func TestHandleInstallSnapshotIgnoresAlreadyAppliedSnapshot(t *testing.T) {
 	}
 	if got, ok := sm.Get("k"); !ok || got != "new" {
 		t.Fatalf("already applied value should remain, got value=%q found=%v", got, ok)
+	}
+}
+
+func TestHandleInstallSnapshotIgnoresCommittedButUnappliedSnapshot(t *testing.T) {
+	store := &mockStore{
+		hs: storage.HardState{CurrentTerm: 1, CommitIndex: 1},
+		entries: []storage.LogEntry{
+			{Index: 1, Term: 1, Command: storage.Command{Op: storage.OpPut, Key: "k", Value: "old"}},
+			{Index: 2, Term: 1, Command: storage.Command{Op: storage.OpPut, Key: "k", Value: "new"}},
+		},
+	}
+	sm := newStubSM()
+	node := newTestNodeWithDeps(t, store, sm, stubTransport{})
+
+	node.mu.Lock()
+	node.commitIndex = 2
+	node.mu.Unlock()
+
+	body, err := json.Marshal(map[string]string{"k": "stale"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := node.HandleInstallSnapshot(InstallSnapshotRequest{
+		Term:              1,
+		LeaderID:          "n2",
+		LastIncludedIndex: 2,
+		LastIncludedTerm:  9,
+		Offset:            0,
+		Data:              body,
+		Done:              true,
+	})
+	if !resp.Success {
+		t.Fatalf("committed snapshot should be acked as stale, got %+v", resp)
+	}
+
+	node.mu.Lock()
+	snapIdx := node.snapshot.LastIncludedIndex
+	applied := node.lastApplied
+	logLen := len(node.log)
+	node.mu.Unlock()
+	if snapIdx != 0 || applied != 1 || logLen != 2 {
+		t.Fatalf("committed stale snapshot should not mutate state, snapshot=%d applied=%d logLen=%d", snapIdx, applied, logLen)
+	}
+	if got, ok := sm.Get("k"); !ok || got != "old" {
+		t.Fatalf("committed-but-unapplied value should remain unapplied, got value=%q found=%v", got, ok)
 	}
 }
 
@@ -1241,23 +1280,21 @@ func TestLinearizableGetDefaultReadTimeout(t *testing.T) {
 	}
 }
 
-func TestLinearizableGetRefreshesExpiredLeaseAfterApplyWait(t *testing.T) {
+func TestLinearizableGetAlwaysUsesFreshQuorumBarrier(t *testing.T) {
 	store := &mockStore{
-		hs: storage.HardState{CurrentTerm: 2},
+		hs: storage.HardState{CurrentTerm: 2, CommitIndex: 1},
 		entries: []storage.LogEntry{
 			{Index: 1, Term: 2, Command: storage.Command{Op: storage.OpPut, Key: "k", Value: "old"}},
 		},
 	}
 	transport := &appendAckTransport{requests: make(chan AppendEntriesRequest, 8)}
-	sm := newBlockingApplySM()
+	sm := newStubSM()
 	node := newTestNodeWithConfig(t, Config{
-		ID:                 "n1",
-		Address:            "n1",
-		Peers:              map[string]string{"n1": "n1", "n2": "n2"},
-		ClientAddresses:    map[string]string{},
-		ElectionTimeoutMin: 40 * time.Millisecond,
-		ElectionTimeoutMax: 80 * time.Millisecond,
-		ReadTimeout:        time.Second,
+		ID:              "n1",
+		Address:         "n1",
+		Peers:           map[string]string{"n1": "n1", "n2": "n2"},
+		ClientAddresses: map[string]string{},
+		ReadTimeout:     time.Second,
 	}, store, sm, transport)
 
 	node.mu.Lock()
@@ -1265,23 +1302,12 @@ func TestLinearizableGetRefreshesExpiredLeaseAfterApplyWait(t *testing.T) {
 	node.currentTerm = 2
 	node.leaderID = node.id
 	node.commitIndex = 1
-	node.lastApplied = 0
+	node.lastApplied = 1
 	node.matchIndex[node.id] = 1
 	node.nextIndex[node.id] = 2
 	node.nextIndex["n2"] = 2
 	node.matchIndex["n2"] = 0
 	node.mu.Unlock()
-
-	applyDone := make(chan struct{})
-	go func() {
-		node.applyReady()
-		close(applyDone)
-	}()
-	select {
-	case <-sm.applyStarted:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for apply to start")
-	}
 
 	type readResult struct {
 		value string
@@ -1296,26 +1322,12 @@ func TestLinearizableGetRefreshesExpiredLeaseAfterApplyWait(t *testing.T) {
 
 	select {
 	case <-transport.requests:
-	case <-time.After(time.Second):
-		close(sm.releaseApply)
-		t.Fatal("timed out waiting for initial read barrier")
-	}
-
-	time.Sleep(node.readLeaseDuration() + 20*time.Millisecond)
-	close(sm.releaseApply)
-
-	select {
-	case <-applyDone:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for apply to finish")
-	}
-
-	select {
-	case <-transport.requests:
+		// A fresh AppendEntries heartbeat is required even though this leader has
+		// recently been active; stale quorum state must not satisfy a read.
 	case res := <-readDone:
-		t.Fatalf("read returned without refreshing the expired lease: %+v", res)
+		t.Fatalf("read returned without a fresh quorum barrier: %+v", res)
 	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for refreshed read barrier")
+		t.Fatal("timed out waiting for fresh read barrier")
 	}
 
 	select {
