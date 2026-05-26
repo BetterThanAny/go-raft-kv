@@ -382,6 +382,36 @@ func TestHandleRequestVoteRejectsWhenHardStateFails(t *testing.T) {
 	}
 }
 
+func TestHandleRequestVoteRejectsInvalidCandidateID(t *testing.T) {
+	for _, candidateID := range []string{"", "unknown", "n1"} {
+		t.Run(candidateID, func(t *testing.T) {
+			store := &mockStore{hs: storage.HardState{CurrentTerm: 1}}
+			node := newTestNode(t, store)
+
+			resp := node.HandleRequestVote(RequestVoteRequest{
+				Term:         2,
+				CandidateID:  candidateID,
+				LastLogIndex: 0,
+				LastLogTerm:  0,
+			})
+
+			if resp.VoteGranted {
+				t.Fatalf("invalid candidate %q must not receive a vote", candidateID)
+			}
+			node.mu.Lock()
+			term := node.currentTerm
+			votedFor := node.votedFor
+			node.mu.Unlock()
+			if term != 1 {
+				t.Fatalf("invalid candidate %q must not advance term, got %d", candidateID, term)
+			}
+			if votedFor != "" {
+				t.Fatalf("invalid candidate %q must not be persisted as votedFor, got %q", candidateID, votedFor)
+			}
+		})
+	}
+}
+
 func TestHandleRequestVoteDoesNotResetElectionOnRejectedVote(t *testing.T) {
 	store := &mockStore{
 		hs: storage.HardState{CurrentTerm: 1},
@@ -470,6 +500,45 @@ func TestBecomeFollowerFailsClosedWhenHardStateFails(t *testing.T) {
 	}
 	if fatalErr == nil {
 		t.Fatal("HardState failure while stepping down must mark storage fatal")
+	}
+}
+
+func TestHandleAppendEntriesRejectsInvalidLeaderID(t *testing.T) {
+	for _, leaderID := range []string{"", "unknown", "n1"} {
+		t.Run(leaderID, func(t *testing.T) {
+			store := &mockStore{}
+			node := newTestNode(t, store)
+
+			resp := node.HandleAppendEntries(AppendEntriesRequest{
+				Term:         2,
+				LeaderID:     leaderID,
+				PrevLogIndex: 0,
+				PrevLogTerm:  0,
+				Entries: []storage.LogEntry{
+					{Index: 1, Term: 2, Command: storage.Command{Op: storage.OpPut, Key: "k", Value: "v"}},
+				},
+				LeaderCommit: 1,
+			})
+
+			if resp.Success {
+				t.Fatalf("invalid leader %q must not be accepted", leaderID)
+			}
+			node.mu.Lock()
+			term := node.currentTerm
+			logLen := len(node.log)
+			commit := node.commitIndex
+			node.mu.Unlock()
+			if term != 0 {
+				t.Fatalf("invalid leader %q must not advance term, got %d", leaderID, term)
+			}
+			if logLen != 0 || commit != 0 {
+				t.Fatalf("invalid leader %q mutated log/commit: log=%d commit=%d", leaderID, logLen, commit)
+			}
+			appendCalls, replaceCalls, _ := store.callCounts()
+			if appendCalls != 0 || replaceCalls != 0 {
+				t.Fatalf("invalid leader %q must not touch WAL, got append=%d replace=%d", leaderID, appendCalls, replaceCalls)
+			}
+		})
 	}
 }
 
@@ -694,6 +763,99 @@ func TestHandleAppendEntriesRejectsWhenCommitPersistFails(t *testing.T) {
 	node.mu.Unlock()
 	if commit != 0 {
 		t.Fatalf("commitIndex should have rolled back, got %d", commit)
+	}
+}
+
+func TestAdvanceCommitFailsClosedWhenHardStatePersistFails(t *testing.T) {
+	store := &mockStore{
+		entries: []storage.LogEntry{
+			{Index: 1, Term: 1, Command: storage.Command{Op: storage.OpPut, Key: "k", Value: "v"}},
+		},
+	}
+	node := newTestNode(t, store)
+
+	waiter := make(chan applyOutcome, 1)
+	node.mu.Lock()
+	node.role = Leader
+	node.currentTerm = 1
+	node.leaderID = node.id
+	node.matchIndex[node.id] = 1
+	node.matchIndex["n2"] = 1
+	node.waiters[1] = append(node.waiters[1], waiter)
+	node.mu.Unlock()
+
+	store.setFailHardState(true)
+
+	node.mu.Lock()
+	node.advanceCommitLocked()
+	role := node.role
+	commit := node.commitIndex
+	fatalErr := node.storageFatal
+	_, waiterStillRegistered := node.waiters[1]
+	node.mu.Unlock()
+
+	if role != Follower {
+		t.Fatalf("leader must fail closed as follower after commit persist failure, got %s", role)
+	}
+	if commit != 0 {
+		t.Fatalf("commitIndex should roll back when hardstate persist fails, got %d", commit)
+	}
+	if fatalErr == nil {
+		t.Fatal("commit persist failure must mark storage fatal")
+	}
+	if waiterStillRegistered {
+		t.Fatal("uncommitted waiter must be failed and removed")
+	}
+	select {
+	case outcome := <-waiter:
+		if !IsNotLeader(outcome.err) {
+			t.Fatalf("waiter should receive not-leader error, got %v", outcome.err)
+		}
+	default:
+		t.Fatal("uncommitted waiter was not notified")
+	}
+}
+
+func TestHandleInstallSnapshotRejectsInvalidLeaderID(t *testing.T) {
+	body, err := json.Marshal(map[string]string{"k": "v"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, leaderID := range []string{"", "unknown", "n1"} {
+		t.Run(leaderID, func(t *testing.T) {
+			store := &mockStore{}
+			node := newTestNode(t, store)
+
+			resp := node.HandleInstallSnapshot(InstallSnapshotRequest{
+				Term:              2,
+				LeaderID:          leaderID,
+				LastIncludedIndex: 1,
+				LastIncludedTerm:  2,
+				Offset:            0,
+				Data:              body,
+				Done:              true,
+			})
+
+			if resp.Success {
+				t.Fatalf("invalid leader %q snapshot must not be accepted", leaderID)
+			}
+			node.mu.Lock()
+			term := node.currentTerm
+			snapIndex := node.snapshot.LastIncludedIndex
+			commit := node.commitIndex
+			node.mu.Unlock()
+			if term != 0 {
+				t.Fatalf("invalid leader %q must not advance term, got %d", leaderID, term)
+			}
+			if snapIndex != 0 || commit != 0 {
+				t.Fatalf("invalid leader %q mutated snapshot/commit: snapshot=%d commit=%d", leaderID, snapIndex, commit)
+			}
+			_, replaceCalls, snapshotCalls := store.callCounts()
+			if replaceCalls != 0 || snapshotCalls != 0 {
+				t.Fatalf("invalid leader %q must not persist snapshot, got replace=%d snapshot=%d", leaderID, replaceCalls, snapshotCalls)
+			}
+		})
 	}
 }
 

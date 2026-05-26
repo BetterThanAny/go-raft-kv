@@ -465,6 +465,9 @@ func (n *Node) HandleRequestVote(req RequestVoteRequest) RequestVoteResponse {
 	if n.stopped || n.storageFatal != nil {
 		return RequestVoteResponse{Term: n.currentTerm}
 	}
+	if !n.isKnownRemotePeerLocked(req.CandidateID) {
+		return RequestVoteResponse{Term: n.currentTerm}
+	}
 	if req.Term < n.currentTerm {
 		return RequestVoteResponse{Term: n.currentTerm}
 	}
@@ -497,6 +500,9 @@ func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRespon
 	defer n.mu.Unlock()
 
 	if n.stopped || n.storageFatal != nil {
+		return AppendEntriesResponse{Term: n.currentTerm, LastLogIndex: n.lastIndexLocked()}
+	}
+	if !n.isKnownRemotePeerLocked(req.LeaderID) {
 		return AppendEntriesResponse{Term: n.currentTerm, LastLogIndex: n.lastIndexLocked()}
 	}
 	if req.Term < n.currentTerm {
@@ -571,6 +577,11 @@ func (n *Node) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshot
 
 	n.mu.Lock()
 	if n.stopped || n.storageFatal != nil {
+		term := n.currentTerm
+		n.mu.Unlock()
+		return InstallSnapshotResponse{Term: term}
+	}
+	if !n.isKnownRemotePeerLocked(req.LeaderID) {
 		term := n.currentTerm
 		n.mu.Unlock()
 		return InstallSnapshotResponse{Term: term}
@@ -667,6 +678,10 @@ func (n *Node) HandleInstallSnapshot(req InstallSnapshotRequest) InstallSnapshot
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.stopped || n.storageFatal != nil {
+		n.pendingSnapshot = nil
+		return InstallSnapshotResponse{Term: n.currentTerm}
+	}
+	if !n.isKnownRemotePeerLocked(req.LeaderID) {
 		n.pendingSnapshot = nil
 		return InstallSnapshotResponse{Term: n.currentTerm}
 	}
@@ -1376,6 +1391,7 @@ func (n *Node) advanceCommitLocked() {
 			n.commitIndex = index
 			if err := n.persistHardStateLocked(); err != nil {
 				n.commitIndex = prev
+				n.failStorageLocked(err)
 				return
 			}
 			n.notifyApplyLocked()
@@ -1770,6 +1786,14 @@ func (n *Node) resetElectionLocked() {
 
 func (n *Node) notLeaderLocked() error {
 	return NotLeaderError{LeaderID: n.leaderID, LeaderAddress: n.leaderAddressLocked()}
+}
+
+func (n *Node) isKnownRemotePeerLocked(id string) bool {
+	if id == "" || id == n.id {
+		return false
+	}
+	_, ok := n.peerAddrs[id]
+	return ok
 }
 
 func (n *Node) leaderAddressLocked() string {
