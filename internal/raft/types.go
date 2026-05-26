@@ -43,6 +43,19 @@ func IsNotLeader(err error) bool {
 	return errors.As(err, &target)
 }
 
+type ProposalUnknownError struct {
+	Index uint64
+	Err   error
+}
+
+func (e ProposalUnknownError) Error() string {
+	return fmt.Sprintf("proposal accepted at log index %d but result unknown: %v", e.Index, e.Err)
+}
+
+func (e ProposalUnknownError) Unwrap() error {
+	return e.Err
+}
+
 type Config struct {
 	ID                 string
 	Address            string

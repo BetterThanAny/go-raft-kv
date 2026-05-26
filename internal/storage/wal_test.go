@@ -3,6 +3,7 @@ package storage
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -234,7 +235,38 @@ func TestWALRejectsMidFileCorruption(t *testing.T) {
 	}
 }
 
-func TestWALRecoversFromCorruptTrailingLine(t *testing.T) {
+func TestWALRejectsChecksumMismatch(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendEntries([]LogEntry{
+		{Index: 1, Term: 1, Command: Command{Op: OpPut, Key: "a", Value: "1"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	walPath := filepath.Join(dir, "wal.jsonl")
+	data, err := os.ReadFile(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = []byte(strings.Replace(string(data), `"value":"1"`, `"value":"9"`, 1))
+	if err := os.WriteFile(walPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := reopened.Load(); err == nil {
+		t.Fatal("expected Load to reject a WAL checksum mismatch")
+	}
+}
+
+func TestWALRejectsCorruptTrailingCompleteLine(t *testing.T) {
 	dir := t.TempDir()
 	walPath := filepath.Join(dir, "wal.jsonl")
 	data := "" +
@@ -249,24 +281,8 @@ func TestWALRecoversFromCorruptTrailingLine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, entries, _, err := store.Load()
-	if err != nil {
-		t.Fatalf("Load should truncate a corrupt trailing WAL record: %v", err)
-	}
-	if len(entries) != 2 || entries[1].Index != 2 {
-		t.Fatalf("expected only complete entries, got %+v", entries)
-	}
-
-	reopened, err := Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, entries, _, err = reopened.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 2 {
-		t.Fatalf("expected truncation to persist, got %d entries", len(entries))
+	if _, _, _, err := store.Load(); err == nil {
+		t.Fatal("expected Load to reject a corrupt complete trailing WAL record")
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"math/rand"
 	"sort"
@@ -102,6 +103,9 @@ func NewNode(cfg Config, store Store, sm StateMachine, transport Transport) (*No
 	}
 
 	normalizeConfig(&cfg)
+	if err := validateConfig(cfg); err != nil {
+		return nil, err
+	}
 	hs, entries, snapshot, err := store.Load()
 	if err != nil {
 		return nil, err
@@ -206,6 +210,19 @@ func normalizeConfig(cfg *Config) {
 	}
 }
 
+func validateConfig(cfg Config) error {
+	if len(cfg.Peers) == 0 {
+		return errors.New("raft peers must not be empty")
+	}
+	if _, ok := cfg.Peers[cfg.ID]; !ok {
+		return fmt.Errorf("raft peers must include local node %q", cfg.ID)
+	}
+	if cfg.Peers[cfg.ID] == "" {
+		return fmt.Errorf("raft peers must include a non-empty address for local node %q", cfg.ID)
+	}
+	return nil
+}
+
 func (n *Node) Start() {
 	n.loops.Add(3)
 	go func() {
@@ -243,6 +260,9 @@ func (n *Node) Stop() {
 }
 
 func (n *Node) Propose(ctx context.Context, command storage.Command) (storage.ApplyResult, error) {
+	if err := ctx.Err(); err != nil {
+		return storage.ApplyResult{}, err
+	}
 	waiter, index, err := n.proposeAppend(command)
 	if err != nil {
 		return storage.ApplyResult{}, err
@@ -261,7 +281,7 @@ func (n *Node) Propose(ctx context.Context, command storage.Command) (storage.Ap
 			return resultFromOutcome(outcome)
 		default:
 		}
-		return storage.ApplyResult{}, ctx.Err()
+		return storage.ApplyResult{}, ProposalUnknownError{Index: index, Err: ctx.Err()}
 	}
 }
 
@@ -437,7 +457,7 @@ func (n *Node) HandleRequestVote(req RequestVoteRequest) RequestVoteResponse {
 		return RequestVoteResponse{Term: n.currentTerm}
 	}
 	if req.Term > n.currentTerm {
-		if err := n.becomeFollowerLocked(req.Term, ""); err != nil {
+		if err := n.becomeFollowerForVoteLocked(req.Term); err != nil {
 			// Could not durably record the new term; do not grant a vote, otherwise
 			// a crash here would allow voting again in the same term after restart.
 			return RequestVoteResponse{Term: n.currentTerm}
@@ -894,6 +914,14 @@ func (n *Node) stepDown(term uint64, leaderID string) {
 // HardState fails, the node fails closed: it must not keep acting as an old
 // leader after observing a higher term or another leader in the current term.
 func (n *Node) becomeFollowerLocked(term uint64, leaderID string) error {
+	return n.becomeFollowerWithTimerLocked(term, leaderID, true)
+}
+
+func (n *Node) becomeFollowerForVoteLocked(term uint64) error {
+	return n.becomeFollowerWithTimerLocked(term, "", false)
+}
+
+func (n *Node) becomeFollowerWithTimerLocked(term uint64, leaderID string, resetElection bool) error {
 	prevRole := n.role
 	if term > n.currentTerm {
 		n.currentTerm = term
@@ -902,7 +930,9 @@ func (n *Node) becomeFollowerLocked(term uint64, leaderID string) error {
 	n.role = Follower
 	n.leaderID = leaderID
 	n.leaderNoopIndex = 0
-	n.resetElectionLocked()
+	if resetElection {
+		n.resetElectionLocked()
+	}
 	if err := n.persistHardStateLocked(); err != nil {
 		n.failStorageLocked(err)
 		return err

@@ -382,6 +382,62 @@ func TestHandleRequestVoteRejectsWhenHardStateFails(t *testing.T) {
 	}
 }
 
+func TestHandleRequestVoteDoesNotResetElectionOnRejectedVote(t *testing.T) {
+	store := &mockStore{
+		hs: storage.HardState{CurrentTerm: 1},
+		entries: []storage.LogEntry{
+			{Index: 1, Term: 2, Command: storage.Command{Op: storage.OpPut, Key: "k", Value: "v"}},
+		},
+	}
+	node := newTestNode(t, store)
+	before := time.Unix(123, 0)
+	node.mu.Lock()
+	node.electionDue = before
+	node.mu.Unlock()
+
+	resp := node.HandleRequestVote(RequestVoteRequest{
+		Term:         3,
+		CandidateID:  "n2",
+		LastLogIndex: 0,
+		LastLogTerm:  1,
+	})
+	if resp.VoteGranted {
+		t.Fatal("stale candidate must not receive a vote")
+	}
+
+	node.mu.Lock()
+	term := node.currentTerm
+	electionDue := node.electionDue
+	node.mu.Unlock()
+	if term != 3 {
+		t.Fatalf("expected term to advance to 3, got %d", term)
+	}
+	if !electionDue.Equal(before) {
+		t.Fatalf("rejected RequestVote must not reset election timeout, got %s want %s", electionDue, before)
+	}
+}
+
+func TestNewNodeRejectsEmptyOrMissingSelfPeers(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		peers map[string]string
+	}{
+		{name: "empty", peers: map[string]string{}},
+		{name: "missing self", peers: map[string]string{"n2": "n2"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewNode(Config{
+				ID:      "n1",
+				Address: "n1",
+				Peers:   tt.peers,
+			}, &mockStore{}, newStubSM(), stubTransport{})
+			if err == nil {
+				t.Fatal("expected invalid peer configuration to be rejected")
+			}
+		})
+	}
+}
+
 func TestBecomeFollowerFailsClosedWhenHardStateFails(t *testing.T) {
 	store := &mockStore{hs: storage.HardState{CurrentTerm: 1}}
 	node := newTestNode(t, store)
@@ -885,6 +941,68 @@ func TestProposeFailsWhenWALAppendFails(t *testing.T) {
 	_, err = node.Propose(ctx, storage.Command{Op: storage.OpPut, Key: "again", Value: "v"})
 	if err == nil {
 		t.Fatal("node must reject later proposals after a fatal storage error")
+	}
+}
+
+func TestProposeChecksContextBeforeAppending(t *testing.T) {
+	store := &mockStore{}
+	node := newTestNode(t, store)
+
+	node.mu.Lock()
+	node.role = Leader
+	node.currentTerm = 1
+	node.leaderID = node.id
+	node.matchIndex[node.id] = 0
+	node.nextIndex[node.id] = 1
+	node.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := node.Propose(ctx, storage.Command{Op: storage.OpPut, Key: "k", Value: "v"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+
+	store.mu.Lock()
+	entries := append([]storage.LogEntry(nil), store.entries...)
+	store.mu.Unlock()
+	if len(entries) != 0 {
+		t.Fatalf("canceled proposal must not append to WAL, got %+v", entries)
+	}
+}
+
+func TestProposeReturnsUnknownAfterAcceptedContextCancel(t *testing.T) {
+	store := &mockStore{}
+	node := newTestNode(t, store)
+
+	node.mu.Lock()
+	node.role = Leader
+	node.currentTerm = 1
+	node.leaderID = node.id
+	node.matchIndex[node.id] = 0
+	node.nextIndex[node.id] = 1
+	for peerID := range node.peerAddrs {
+		node.nextIndex[peerID] = 1
+		node.matchIndex[peerID] = 0
+	}
+	node.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	_, err := node.Propose(ctx, storage.Command{Op: storage.OpPut, Key: "k", Value: "v"})
+	var unknown ProposalUnknownError
+	if !errors.As(err, &unknown) {
+		t.Fatalf("expected ProposalUnknownError after accepted proposal times out, got %v", err)
+	}
+	if unknown.Index != 1 {
+		t.Fatalf("expected accepted index 1, got %d", unknown.Index)
+	}
+
+	store.mu.Lock()
+	entries := append([]storage.LogEntry(nil), store.entries...)
+	store.mu.Unlock()
+	if len(entries) != 1 || entries[0].Index != 1 {
+		t.Fatalf("proposal should remain durably accepted, got %+v", entries)
 	}
 }
 

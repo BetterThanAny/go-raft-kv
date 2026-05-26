@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"sync"
@@ -41,6 +42,7 @@ type walLine struct {
 	Index             uint64  `json:"index,omitempty"`
 	Term              uint64  `json:"term,omitempty"`
 	Command           Command `json:"command,omitempty"`
+	CRC               *uint32 `json:"crc,omitempty"`
 }
 
 func Open(dir string) (*Store, error) {
@@ -129,17 +131,13 @@ func (s *Store) AppendEntries(entries []LogEntry) error {
 	}
 	enc := json.NewEncoder(file)
 	if created {
-		if err := enc.Encode(walBaseRecord{
-			Type:              walBaseRecordType,
-			LastIncludedIndex: baseIndex,
-			LastIncludedTerm:  baseTerm,
-		}); err != nil {
+		if err := encodeWALBase(enc, baseIndex, baseTerm); err != nil {
 			_ = file.Close()
 			return err
 		}
 	}
 	for _, entry := range entries {
-		if err := enc.Encode(entry); err != nil {
+		if err := encodeWALEntry(enc, entry); err != nil {
 			_ = file.Close()
 			return err
 		}
@@ -207,12 +205,6 @@ func readWAL(path string) (walData, error) {
 		}
 		record, err := decodeWALLine(line)
 		if err != nil {
-			if len(bytes.TrimSpace(data[offset:])) == 0 {
-				if err := truncateFile(path, int64(offset-nl-1)); err != nil {
-					return walData{}, fmt.Errorf("truncate corrupt WAL tail: %w", err)
-				}
-				break
-			}
 			return walData{}, fmt.Errorf("decode WAL entry at byte offset %d: %w", offset-nl-1, err)
 		}
 		if record.base != nil {
@@ -252,16 +244,12 @@ func writeWALAtomic(dir, path string, baseIndex, baseTerm uint64, entries []LogE
 		return err
 	}
 	enc := json.NewEncoder(file)
-	if err := enc.Encode(walBaseRecord{
-		Type:              walBaseRecordType,
-		LastIncludedIndex: baseIndex,
-		LastIncludedTerm:  baseTerm,
-	}); err != nil {
+	if err := encodeWALBase(enc, baseIndex, baseTerm); err != nil {
 		_ = file.Close()
 		return err
 	}
 	for _, entry := range entries {
-		if err := enc.Encode(entry); err != nil {
+		if err := encodeWALEntry(enc, entry); err != nil {
 			_ = file.Close()
 			return err
 		}
@@ -289,6 +277,15 @@ func decodeWALLine(line []byte) (decodedWALLine, error) {
 	if err := json.Unmarshal(line, &raw); err != nil {
 		return decodedWALLine{}, err
 	}
+	if raw.CRC != nil {
+		sum, err := walChecksum(raw)
+		if err != nil {
+			return decodedWALLine{}, err
+		}
+		if sum != *raw.CRC {
+			return decodedWALLine{}, fmt.Errorf("checksum mismatch")
+		}
+	}
 	switch raw.Type {
 	case walBaseRecordType:
 		return decodedWALLine{
@@ -309,6 +306,42 @@ func decodeWALLine(line []byte) (decodedWALLine, error) {
 	default:
 		return decodedWALLine{}, fmt.Errorf("unknown WAL record type %q", raw.Type)
 	}
+}
+
+func encodeWALBase(enc *json.Encoder, baseIndex, baseTerm uint64) error {
+	line := walLine{
+		Type:              walBaseRecordType,
+		LastIncludedIndex: baseIndex,
+		LastIncludedTerm:  baseTerm,
+	}
+	return encodeWALLine(enc, line)
+}
+
+func encodeWALEntry(enc *json.Encoder, entry LogEntry) error {
+	line := walLine{
+		Index:   entry.Index,
+		Term:    entry.Term,
+		Command: entry.Command,
+	}
+	return encodeWALLine(enc, line)
+}
+
+func encodeWALLine(enc *json.Encoder, line walLine) error {
+	sum, err := walChecksum(line)
+	if err != nil {
+		return err
+	}
+	line.CRC = &sum
+	return enc.Encode(line)
+}
+
+func walChecksum(line walLine) (uint32, error) {
+	line.CRC = nil
+	data, err := json.Marshal(line)
+	if err != nil {
+		return 0, err
+	}
+	return crc32.ChecksumIEEE(data), nil
 }
 
 func reconcileWALWithSnapshot(wal walData, snap Snapshot) ([]LogEntry, bool) {
