@@ -122,3 +122,26 @@ func TestWithLeaderRetryDeduplicatesRepeatedLeaderHints(t *testing.T) {
 		t.Fatalf("calls mismatch: got %v want %v", calls, want)
 	}
 }
+
+func TestWithLeaderRetryIgnoresSelfLeaderHint(t *testing.T) {
+	var calls []string
+	responses := map[string]*api.PutResponse{
+		"stale": {OK: false, Error: "not leader", LeaderAddress: "stale"},
+	}
+
+	_, err := withLeaderRetryUsing(
+		context.Background(),
+		[]string{"stale"},
+		func(context.Context, *api.KVClient) (*api.PutResponse, error) { return nil, nil },
+		func(_ context.Context, endpoint string, _ func(context.Context, *api.KVClient) (*api.PutResponse, error)) (*api.PutResponse, error) {
+			calls = append(calls, endpoint)
+			return responses[endpoint], nil
+		},
+	)
+	if err == nil {
+		t.Fatal("expected no reachable leader")
+	}
+	if want := []string{"stale"}; !reflect.DeepEqual(calls, want) {
+		t.Fatalf("calls mismatch: got %v want %v", calls, want)
+	}
+}

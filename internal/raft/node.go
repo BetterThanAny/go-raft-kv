@@ -420,6 +420,18 @@ func (n *Node) Status() Status {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	if n.stopped {
+		return Status{
+			ID:            n.id,
+			Address:       n.address,
+			Term:          n.currentTerm,
+			CommitIndex:   n.commitIndex,
+			LastApplied:   n.lastApplied,
+			LastLogIndex:  n.lastIndexLocked(),
+			SnapshotIndex: n.snapshot.LastIncludedIndex,
+		}
+	}
+
 	peers := make([]PeerStatus, 0, len(n.peerAddrs))
 	for id, addr := range n.peerAddrs {
 		peers = append(peers, PeerStatus{
@@ -515,7 +527,7 @@ func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRespon
 
 	// Snapshot in-memory log before mutating so we can roll back if WAL write fails.
 	prevLog := n.log
-	merge := n.mergeEntriesLocked(req.Entries)
+	merge := n.mergeEntriesLocked(req.PrevLogIndex, req.Entries)
 	if merge.conflictIndex > 0 {
 		return AppendEntriesResponse{
 			Term:          n.currentTerm,
@@ -536,9 +548,10 @@ func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRespon
 			return AppendEntriesResponse{Term: n.currentTerm, LastLogIndex: n.lastIndexLocked()}
 		}
 	}
-	if req.LeaderCommit > n.commitIndex {
+	newCommit := min(req.LeaderCommit, merge.lastNewIndex)
+	if newCommit > n.commitIndex {
 		prevCommit := n.commitIndex
-		n.commitIndex = min(req.LeaderCommit, n.lastIndexLocked())
+		n.commitIndex = newCommit
 		if err := n.persistHardStateLocked(); err != nil {
 			n.commitIndex = prevCommit
 			return AppendEntriesResponse{Term: n.currentTerm, LastLogIndex: n.lastIndexLocked()}
@@ -755,7 +768,7 @@ func (n *Node) heartbeatLoop() {
 		case <-n.replicateCh:
 		}
 		if n.isLeader() {
-			ctx, cancel := context.WithTimeout(context.Background(), n.heartbeatEvery)
+			ctx, cancel := context.WithTimeout(context.Background(), n.timeoutMin)
 			_ = n.replicateAllOnce(ctx)
 			cancel()
 		}
@@ -1489,14 +1502,21 @@ type mergeEntriesResult struct {
 	replaced      bool
 	appended      []storage.LogEntry
 	conflictIndex uint64
+	lastNewIndex  uint64
 }
 
-func (n *Node) mergeEntriesLocked(entries []storage.LogEntry) mergeEntriesResult {
-	if conflictIndex := n.validateEntriesLocked(entries); conflictIndex > 0 {
+func (n *Node) mergeEntriesLocked(prevLogIndex uint64, entries []storage.LogEntry) mergeEntriesResult {
+	lastNewIndex := prevLogIndex
+	for _, entry := range entries {
+		if entry.Index > n.snapshot.LastIncludedIndex && entry.Index > lastNewIndex {
+			lastNewIndex = entry.Index
+		}
+	}
+	if conflictIndex := n.validateEntriesLocked(prevLogIndex, entries); conflictIndex > 0 {
 		return mergeEntriesResult{conflictIndex: conflictIndex}
 	}
 
-	var result mergeEntriesResult
+	result := mergeEntriesResult{lastNewIndex: lastNewIndex}
 	for i, entry := range entries {
 		if entry.Index <= n.snapshot.LastIncludedIndex {
 			continue
@@ -1506,9 +1526,12 @@ func (n *Node) mergeEntriesLocked(entries []storage.LogEntry) mergeEntriesResult
 			if ok && term == entry.Term {
 				continue
 			}
+			if entry.Index <= n.commitIndex {
+				return mergeEntriesResult{conflictIndex: entry.Index, lastNewIndex: lastNewIndex}
+			}
 			n.truncateFromLocked(entry.Index)
 			n.log = append(n.log, entries[i:]...)
-			return mergeEntriesResult{changed: true, replaced: true}
+			return mergeEntriesResult{changed: true, replaced: true, lastNewIndex: lastNewIndex}
 		}
 		if entry.Index != n.lastIndexLocked()+1 {
 			return mergeEntriesResult{conflictIndex: n.lastIndexLocked() + 1}
@@ -1520,11 +1543,14 @@ func (n *Node) mergeEntriesLocked(entries []storage.LogEntry) mergeEntriesResult
 	return result
 }
 
-func (n *Node) validateEntriesLocked(entries []storage.LogEntry) uint64 {
+func (n *Node) validateEntriesLocked(prevLogIndex uint64, entries []storage.LogEntry) uint64 {
 	var prev uint64
 	for _, entry := range entries {
 		if entry.Index <= n.snapshot.LastIncludedIndex {
 			continue
+		}
+		if prev == 0 && entry.Index != prevLogIndex+1 {
+			return prevLogIndex + 1
 		}
 		if prev != 0 && entry.Index != prev+1 {
 			return prev + 1

@@ -592,6 +592,72 @@ func TestHandleAppendEntriesRejectsNonContiguousEntries(t *testing.T) {
 	}
 }
 
+func TestHandleAppendEntriesHeartbeatDoesNotCommitStaleSuffix(t *testing.T) {
+	store := &mockStore{
+		entries: []storage.LogEntry{
+			{Index: 1, Term: 1, Command: storage.Command{Op: storage.OpPut, Key: "safe", Value: "1"}},
+			{Index: 2, Term: 9, Command: storage.Command{Op: storage.OpPut, Key: "stale", Value: "2"}},
+		},
+	}
+	node := newTestNode(t, store)
+
+	resp := node.HandleAppendEntries(AppendEntriesRequest{
+		Term:         2,
+		LeaderID:     "n2",
+		PrevLogIndex: 1,
+		PrevLogTerm:  1,
+		LeaderCommit: 2,
+	})
+	if !resp.Success {
+		t.Fatalf("matching heartbeat should succeed: %+v", resp)
+	}
+
+	node.mu.Lock()
+	commit := node.commitIndex
+	node.mu.Unlock()
+	if commit != 1 {
+		t.Fatalf("heartbeat must only commit through prevLogIndex, got commitIndex=%d", commit)
+	}
+}
+
+func TestHandleAppendEntriesRejectsCommittedConflict(t *testing.T) {
+	store := &mockStore{
+		hs: storage.HardState{CurrentTerm: 2, CommitIndex: 1},
+		entries: []storage.LogEntry{
+			{Index: 1, Term: 1, Command: storage.Command{Op: storage.OpPut, Key: "k", Value: "committed"}},
+		},
+	}
+	node := newTestNode(t, store)
+
+	resp := node.HandleAppendEntries(AppendEntriesRequest{
+		Term:         2,
+		LeaderID:     "n2",
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+		Entries: []storage.LogEntry{
+			{Index: 1, Term: 2, Command: storage.Command{Op: storage.OpPut, Key: "k", Value: "overwrite"}},
+		},
+	})
+	if resp.Success {
+		t.Fatal("AppendEntries must reject a conflict at an already committed index")
+	}
+
+	node.mu.Lock()
+	logCopy := append([]storage.LogEntry(nil), node.log...)
+	commit := node.commitIndex
+	node.mu.Unlock()
+	if commit != 1 {
+		t.Fatalf("commitIndex changed after committed conflict, got %d", commit)
+	}
+	if len(logCopy) != 1 || logCopy[0].Term != 1 || logCopy[0].Command.Value != "committed" {
+		t.Fatalf("committed entry was mutated: %+v", logCopy)
+	}
+	appendCalls, replaceCalls, _ := store.callCounts()
+	if appendCalls != 0 || replaceCalls != 0 {
+		t.Fatalf("committed conflict must not touch storage, got append=%d replace=%d", appendCalls, replaceCalls)
+	}
+}
+
 func TestHandleAppendEntriesRejectsWhenCommitPersistFails(t *testing.T) {
 	store := &mockStore{}
 	node := newTestNode(t, store)
@@ -1033,6 +1099,27 @@ func TestProposeReturnsNodeStoppedAfterStop(t *testing.T) {
 	appendCalls, _, _ := store.callCounts()
 	if appendCalls != 0 {
 		t.Fatalf("stopped node must not append new proposals, got %d appends", appendCalls)
+	}
+}
+
+func TestStatusAfterStopDoesNotReturnStaleLeader(t *testing.T) {
+	store := &mockStore{}
+	node := newTestNode(t, store)
+
+	node.mu.Lock()
+	node.role = Leader
+	node.currentTerm = 2
+	node.leaderID = node.id
+	node.mu.Unlock()
+
+	node.Stop()
+
+	status := node.Status()
+	if status.Role != "" {
+		t.Fatalf("stopped node should not report an active role, got %q", status.Role)
+	}
+	if status.LeaderID != "" || status.LeaderAddress != "" {
+		t.Fatalf("stopped node should not return stale leader hints: %+v", status)
 	}
 }
 

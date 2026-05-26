@@ -187,7 +187,7 @@ func withLeaderRetryUsing[T any](ctx context.Context, endpoints []string, fn fun
 			if msg := responseError(resp); msg != "" {
 				lastErr = errors.New(msg)
 			}
-			if leaderAddr != "" && !queuedHints[leaderAddr] {
+			if leaderAddr != "" && leaderAddr != endpoint && !queuedHints[leaderAddr] {
 				queue = append(queue, leaderAddr)
 				queuedHints[leaderAddr] = true
 			}
